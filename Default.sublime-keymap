@@ -1,0 +1,219 @@
+[
+	{
+		"keys": [
+			"enter"
+		],
+		"command": "claude_chat_send",
+		"context": [
+			{
+				"key": "setting.claude_chat",
+				"operator": "equal",
+				"operand": true
+			},
+			{
+				"key": "auto_complete_visible",
+				"operator": "equal",
+				"operand": false
+			}
+		]
+	},
+	{
+		"keys": [
+			"ctrl+enter"
+		],
+		"command": "claude_chat_send",
+		"context": [
+			{
+				"key": "setting.claude_chat",
+				"operator": "equal",
+				"operand": true
+			}
+		]
+	},
+	{
+		"keys": [
+			"shift+enter"
+		],
+		"command": "insert",
+		"args": {
+			"characters": "\n"
+		},
+		"context": [
+			{
+				"key": "setting.claude_chat",
+				"operator": "equal",
+				"operand": true
+			}
+		]
+	},
+	{
+		"keys": [
+			"@"
+		],
+		"command": "claude_attach_file",
+		"context": [
+			{
+				"key": "setting.claude_chat",
+				"operator": "equal",
+				"operand": true
+			}
+		]
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"a"
+		],
+		"command": "claude_chat"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"n"
+		],
+		"command": "claude_new_chat"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"h"
+		],
+		"command": "claude_history"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"i"
+		],
+		"command": "claude_attach_file"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"m"
+		],
+		"command": "claude_toggle_edit"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"j"
+		],
+		"command": "claude_select_model"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"r"
+		],
+		"command": "claude_review_file"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"d"
+		],
+		"command": "claude_review_changes"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"b"
+		],
+		"command": "claude_explain_build"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"x"
+		],
+		"command": "claude_explain_clipboard"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"w"
+		],
+		"command": "claude_write_code"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"e"
+		],
+		"command": "claude_edit_file"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"l"
+		],
+		"command": "claude_fix_diagnostics"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"p"
+		],
+		"command": "claude_write_tests"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"c"
+		],
+		"command": "claude_run_tests"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"z"
+		],
+		"command": "claude_revert_edit"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"g"
+		],
+		"command": "claude_commit_message"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"v"
+		],
+		"command": "claude_remote_status"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"o"
+		],
+		"command": "claude_remote_logs"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"t"
+		],
+		"command": "claude_terminal"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"f"
+		],
+		"command": "claude_terminal",
+		"args": {
+			"with_file": true
+		}
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"s"
+		],
+		"command": "claude_stop"
+	}
+]

@@ -1,0 +1,109 @@
+[
+	{
+		"caption": "Claude: Abrir chat",
+		"command": "claude_chat"
+	},
+	{
+		"caption": "Claude: Chat nuevo (olvidar la conversación)",
+		"command": "claude_new_chat"
+	},
+	{
+		"caption": "Claude: Conversaciones anteriores…",
+		"command": "claude_history"
+	},
+	{
+		"caption": "Claude: Adjuntar un archivo al mensaje…",
+		"command": "claude_attach_file"
+	},
+	{
+		"caption": "Claude: Permitir o impedir que el chat edite archivos",
+		"command": "claude_toggle_edit"
+	},
+	{
+		"caption": "Claude: Elegir modelo…",
+		"command": "claude_select_model"
+	},
+	{
+		"caption": "Claude: Revisar errores de este archivo",
+		"command": "claude_review_file"
+	},
+	{
+		"caption": "Claude: Revisar cambios sin confirmar (git)",
+		"command": "claude_review_changes"
+	},
+	{
+		"caption": "Claude: Explicar errores del último build",
+		"command": "claude_explain_build"
+	},
+	{
+		"caption": "Claude: Explicar el error copiado en el portapapeles",
+		"command": "claude_explain_clipboard"
+	},
+	{
+		"caption": "Claude: Escribir código aquí…",
+		"command": "claude_write_code"
+	},
+	{
+		"caption": "Claude: Editar este archivo…",
+		"command": "claude_edit_file"
+	},
+	{
+		"caption": "Claude: Corregir avisos del linter",
+		"command": "claude_fix_diagnostics"
+	},
+	{
+		"caption": "Claude: Generar pruebas (pytest)",
+		"command": "claude_write_tests"
+	},
+	{
+		"caption": "Claude: Correr las pruebas y corregir lo que falle",
+		"command": "claude_run_tests"
+	},
+	{
+		"caption": "Claude: Revertir la última edición",
+		"command": "claude_revert_edit"
+	},
+	{
+		"caption": "Claude: Proponer mensaje de commit",
+		"command": "claude_commit_message"
+	},
+	{
+		"caption": "Claude: Ver el estado del servidor",
+		"command": "claude_remote_status"
+	},
+	{
+		"caption": "Claude: Diagnosticar logs del servidor…",
+		"command": "claude_remote_logs"
+	},
+	{
+		"caption": "Claude: Abrir en terminal",
+		"command": "claude_terminal"
+	},
+	{
+		"caption": "Claude: Abrir en terminal con este archivo",
+		"command": "claude_terminal",
+		"args": {
+			"with_file": true
+		}
+	},
+	{
+		"caption": "Claude: Detener",
+		"command": "claude_stop"
+	},
+	{
+		"caption": "Preferences: Claude Settings",
+		"command": "edit_settings",
+		"args": {
+			"base_file": "${packages}/ClaudeCode/ClaudeCode.sublime-settings",
+			"default": "{\n\t$0\n}\n"
+		}
+	},
+	{
+		"caption": "Preferences: Claude Key Bindings",
+		"command": "edit_settings",
+		"args": {
+			"base_file": "${packages}/ClaudeCode/Default.sublime-keymap",
+			"default": "[\n\t$0\n]\n"
+		}
+	}
+]

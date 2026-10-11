@@ -1,0 +1,48 @@
+%YAML 1.2
+---
+name: Claude Chat
+scope: text.claude-chat
+hidden: true
+contexts:
+  main:
+    - match: '^#{2,3} .*$'
+      scope: markup.heading.claude-chat
+    - match: '^❯ '
+      scope: keyword.control.claude-chat
+    - match: '^>.*$'
+      scope: markup.quote.claude-chat
+    - match: '^  ⚙ .*$'
+      scope: comment.line.claude-chat
+    - match: '^— .*$'
+      scope: comment.line.claude-chat
+    - match: '^\s*```diff\s*$'
+      scope: punctuation.definition.raw.claude-chat
+      push: diff
+    - match: '^\s*```.*$'
+      scope: punctuation.definition.raw.claude-chat
+      push: fenced
+    - match: '`[^`\n]+`'
+      scope: markup.raw.inline.claude-chat
+    - match: '\*\*[^*\n]+\*\*'
+      scope: markup.bold.claude-chat
+  fenced:
+    - meta_content_scope: markup.raw.block.claude-chat
+    - match: '^\s*```\s*$'
+      scope: punctuation.definition.raw.claude-chat
+      pop: true
+    - match: '^(?=❯ )'
+      pop: true
+  diff:
+    - match: '^\s*```\s*$'
+      scope: punctuation.definition.raw.claude-chat
+      pop: true
+    - match: '^(?=❯ )'
+      pop: true
+    - match: '^(\+\+\+|---) .*$'
+      scope: meta.diff.header.claude-chat comment.line.claude-chat
+    - match: '^@@.*$'
+      scope: meta.diff.range.claude-chat entity.name.section.claude-chat
+    - match: '^\+.*$'
+      scope: markup.inserted.claude-chat
+    - match: '^-.*$'
+      scope: markup.deleted.claude-chat

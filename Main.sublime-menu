@@ -1,0 +1,122 @@
+[
+	{
+		"id": "tools",
+		"children": [
+			{
+				"caption": "Claude",
+				"id": "claude",
+				"children": [
+					{
+						"caption": "Abrir chat",
+						"command": "claude_chat"
+					},
+					{
+						"caption": "Chat nuevo (olvidar la conversación)",
+						"command": "claude_new_chat"
+					},
+					{
+						"caption": "Conversaciones anteriores…",
+						"command": "claude_history"
+					},
+					{
+						"caption": "Adjuntar un archivo al mensaje…",
+						"command": "claude_attach_file"
+					},
+					{
+						"caption": "Permitir o impedir que el chat edite archivos",
+						"command": "claude_toggle_edit"
+					},
+					{
+						"caption": "Elegir modelo…",
+						"command": "claude_select_model"
+					},
+					{
+						"caption": "-"
+					},
+					{
+						"caption": "Revisar errores de este archivo",
+						"command": "claude_review_file"
+					},
+					{
+						"caption": "Revisar cambios sin confirmar (git)",
+						"command": "claude_review_changes"
+					},
+					{
+						"caption": "Explicar errores del último build",
+						"command": "claude_explain_build"
+					},
+					{
+						"caption": "Explicar el error copiado en el portapapeles",
+						"command": "claude_explain_clipboard"
+					},
+					{
+						"caption": "-"
+					},
+					{
+						"caption": "Escribir código aquí…",
+						"command": "claude_write_code"
+					},
+					{
+						"caption": "Editar este archivo…",
+						"command": "claude_edit_file"
+					},
+					{
+						"caption": "Corregir avisos del linter",
+						"command": "claude_fix_diagnostics"
+					},
+					{
+						"caption": "Generar pruebas (pytest)",
+						"command": "claude_write_tests"
+					},
+					{
+						"caption": "Correr las pruebas y corregir lo que falle",
+						"command": "claude_run_tests"
+					},
+					{
+						"caption": "Revertir la última edición",
+						"command": "claude_revert_edit"
+					},
+					{
+						"caption": "-"
+					},
+					{
+						"caption": "Proponer mensaje de commit",
+						"command": "claude_commit_message"
+					},
+					{
+						"caption": "-"
+					},
+					{
+						"caption": "Ver el estado del servidor",
+						"command": "claude_remote_status"
+					},
+					{
+						"caption": "Diagnosticar logs del servidor…",
+						"command": "claude_remote_logs"
+					},
+					{
+						"caption": "-"
+					},
+					{
+						"caption": "Abrir en terminal",
+						"command": "claude_terminal"
+					},
+					{
+						"caption": "Abrir en terminal con este archivo",
+						"command": "claude_terminal",
+						"args": {
+							"with_file": true
+						}
+					},
+					{
+						"caption": "-"
+					},
+					{
+						"caption": "Detener",
+						"command": "claude_stop"
+					}
+				]
+			}
+		]
+	}
+]

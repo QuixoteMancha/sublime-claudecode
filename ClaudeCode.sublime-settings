@@ -1,0 +1,61 @@
+{
+	// Ejecutable de Claude Code. Se busca en el PATH, ~/.local/bin y ~/.claude/local.
+	"claude_path": "claude",
+
+	// Modelo y esfuerzo; vacío usa lo que tenga configurado Claude Code.
+	// El modelo también se cambia con «Claude: Elegir modelo…».
+	"model": "",
+	"effort": "",
+
+	// Herramientas de las consultas de sólo lectura (preguntas y revisiones).
+	"read_tools": "Read,Grep,Glob",
+
+	// Herramientas de los comandos que editan y del chat cuando puede editar.
+	// Sin Bash: no ejecuta comandos.
+	"edit_tools": "Read,Edit,Write,Grep,Glob",
+
+	// Respalda cada archivo antes de que Claude lo edite, para mostrar el diff
+	// al terminar y poder revertir. Necesita python3 en el sistema.
+	"review_edits": true,
+
+	// Dónde se abre el chat: "right" (columna a la derecha) o "tab" (una pestaña más).
+	"chat_position": "right",
+
+	// ruff para «Corregir avisos del linter» cuando LSP no atiende el archivo.
+	// Vacío lo busca en el entorno del proyecto, en el PATH y en LSP-ruff.
+	"ruff_path": "",
+
+	// Segundos que se espera a pytest en «Correr las pruebas».
+	"test_timeout": 300,
+
+	// Servidor de «Ver el estado del servidor» y «Diagnosticar logs del servidor»:
+	// un nombre o IP, o "usuario@servidor". Se entra por SSH sin pedir clave
+	// (BatchMode), y sólo se ejecutan los dos comandos de abajo. Vacío desactiva
+	// esos comandos.
+	"remote_host": "",
+	"remote_ssh_args": [],
+	"remote_log_lines": 200,
+
+	// Lista de servicios: una línea por servicio, «nombre<TAB>estado». Incluye
+	// los detenidos, que son justo los que interesa diagnosticar.
+	// Con systemd:
+	//   "systemctl list-units --type=service --state=running --no-legend --plain | awk '{print $1\"\\t\"$4}'"
+	"remote_list_command": "docker ps -a --format '{{.Names}}\\t{{.Status}}'",
+
+	// Logs de un servicio; {name} y {lines} se reemplazan.
+	// Con systemd: "journalctl -u {name} -n {lines} --no-pager"
+	"remote_logs_command": "docker logs --tail {lines} {name} 2>&1",
+
+	// Argumentos adicionales para `claude -p`.
+	"extra_args": [],
+
+	// «Abrir en terminal»: "auto" usa Terminus (una pestaña del editor) si está
+	// instalado; "external" abre siempre la terminal del sistema.
+	"terminal_mode": "auto",
+
+	// Terminal del sistema; vacío detecta la que haya.
+	"terminal": "",
+
+	// Lo que va entre la terminal y el guion que lanza Claude.
+	"terminal_args": ["-e"]
+}
