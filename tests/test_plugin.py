@@ -6,7 +6,7 @@ import tempfile
 import types
 import unittest
 
-PACKAGES = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 errors = []
 
 
@@ -218,7 +218,11 @@ class _Command(object):
 sublime_plugin.WindowCommand = sublime_plugin.TextCommand = _Command
 sublime_plugin.EventListener = sublime_plugin.ViewEventListener = _Command
 sys.modules.update(sublime=sublime, sublime_plugin=sublime_plugin)
-sys.path.insert(0, PACKAGES)
+# Dentro de Sublime el paquete se llama ClaudeCode, se llame como se llame la carpeta
+# del proyecto (la instalada es un enlace a ésta).
+package = types.ModuleType("ClaudeCode")
+package.__path__ = [ROOT]
+sys.modules["ClaudeCode"] = package
 plugin = importlib.import_module("ClaudeCode.claude_plugin")
 
 ANSWER = [("session", "s1"), ("text_start", None), ("text", "Miro el archivo."),
@@ -1310,7 +1314,7 @@ class ChatTest(unittest.TestCase):
 
     def test_recursos_apuntan_a_comandos_que_existen(self):
         import json
-        root = os.path.join(PACKAGES, "ClaudeCode")
+        root = ROOT
         names = set()
 
         def walk(node):
@@ -1329,7 +1333,7 @@ class ChatTest(unittest.TestCase):
         for name in names - {"edit_settings", "insert"}:
             cls = "".join(part.capitalize() for part in name.split("_")) + "Command"
             self.assertTrue(hasattr(plugin, cls), name)
-        self.assertTrue(os.path.isfile(os.path.join(PACKAGES, plugin.SYNTAX.split("/", 1)[1])))
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, plugin.SYNTAX.split("/", 2)[2])))
         self.assertIn("claude_chat_send", names)
 
 

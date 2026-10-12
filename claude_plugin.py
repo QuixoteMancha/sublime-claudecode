@@ -596,7 +596,7 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             return
         label = turn.get("label")
         if label:
-            text = "{} {:.0f} s".format(label, time.time() - turn["since"])
+            text = "{} {} s".format(label, int(time.time() - turn["since"]))
             working(text)
             if shown():
                 _show_activity(turn["view"], turn, text)
@@ -787,7 +787,9 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
                 code, ": " + str(detail) if detail else ""))
         else:
             # El modo queda a la vista en cada turno: es el que rige el próximo mensaje.
-            parts = ["listo ({:.0f} s)".format(time.time() - started)]
+            # Segundos cumplidos, como el contador de la espera: redondeado mostraba
+            # «4 s» cuando en pantalla se había visto pasar hasta el 3.
+            parts = ["listo ({} s)".format(int(time.time() - started))]
             if shown():
                 parts.append(_mode_label(view))
             parts.append(core.context_text(turn.get("tokens"), result))
