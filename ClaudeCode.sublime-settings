@@ -11,12 +11,43 @@
 	"read_tools": "Read,Grep,Glob",
 
 	// Herramientas de los comandos que editan y del chat cuando puede editar.
-	// Sin Bash: no ejecuta comandos.
 	"edit_tools": "Read,Edit,Write,Grep,Glob",
+
+	// El chat deja un proceso de Claude vivo por conversación en vez de lanzar uno por
+	// mensaje: responde antes y puede pedir permiso. Si ese proceso no arranca, el
+	// plugin vuelve solo al modo de un proceso por mensaje. Cada chat abierto con una
+	// conversación en curso mantiene su proceso hasta que se cierra o se vacía.
+	"persistent_chat": true,
+
+	// Herramientas que se suman al chat en modo edición y que piden aprobación en el
+	// editor antes de cada uso (salvo lo que ya permitan tus ajustes de Claude Code).
+	// Sólo con "persistent_chat"; sin él no hay quién pregunte y no se ofrecen.
+	// Vacío deja el chat sin ejecutar comandos. Lo que haga Bash no entra en el diff
+	// ni en «Revertir la última edición».
+	"ask_tools": "Bash",
 
 	// Respalda cada archivo antes de que Claude lo edite, para mostrar el diff
 	// al terminar y poder revertir. Necesita python3 en el sistema.
 	"review_edits": true,
+
+	// Si el chat nace pudiendo editar archivos. Con false nace de sólo lectura y se
+	// habilita con «Permitir o impedir que el chat edite archivos» (Ctrl+Alt+C, M).
+	"chat_edit_default": false,
+
+	// El diff de una edición llega plegado, un pliegue por archivo; se abre con
+	// «Plegar o desplegar los bloques del chat» (Ctrl+Alt+C, K) o desde la marca del pliegue.
+	"fold_edits": true,
+
+	// Un bloque de código de una respuesta con más líneas que éstas llega plegado,
+	// con las primeras a la vista. 0 no pliega nunca.
+	"fold_code_lines": 40,
+
+	// Los errores y advertencias que LSP tenga del archivo abierto viajan como contexto.
+	"context_diagnostics": true,
+
+	// Agrega a la línea de cierre el costo que informa el CLI (con suscripción es
+	// sólo referencial).
+	"show_cost": false,
 
 	// Dónde se abre el chat: "right" (columna a la derecha) o "tab" (una pestaña más).
 	"chat_position": "right",

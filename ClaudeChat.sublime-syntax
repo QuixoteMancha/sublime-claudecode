@@ -11,7 +11,7 @@ contexts:
       scope: keyword.control.claude-chat
     - match: '^>.*$'
       scope: markup.quote.claude-chat
-    - match: '^  ⚙ .*$'
+    - match: '^  [⚙⋯?✘] .*$'
       scope: comment.line.claude-chat
     - match: '^— .*$'
       scope: comment.line.claude-chat

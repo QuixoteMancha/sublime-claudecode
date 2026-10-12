@@ -1,8 +1,10 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,6 +34,45 @@ class ParseLine(unittest.TestCase):
             {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "a.py"}}]})
         self.assertEqual(core.parse_line(message), [("tool", ("t1", "Read a.py"))])
 
+    def test_avisa_que_hace_mientras_no_escribe(self):
+        def start(**block):
+            return line(type="stream_event", event={
+                "type": "content_block_start", "content_block": block})
+        self.assertEqual(core.parse_line(start(type="thinking", thinking="")),
+                         [("activity", "pensando…")])
+        self.assertEqual(core.parse_line(start(type="tool_use", id="t1", name="Edit", input={})),
+                         [("activity", "preparando Edit…")])
+        done = line(type="user", message={"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]})
+        self.assertEqual(core.parse_line(done), [("activity", "esperando la respuesta…")])
+        self.assertEqual(core.parse_line(line(type="user", message={"content": "hola"})), [])
+        sub = line(type="user", parent_tool_use_id="t9", message={"content": [
+            {"type": "tool_result", "tool_use_id": "t2", "content": "ok"}]})
+        self.assertEqual(core.parse_line(sub), [])
+        agent = line(type="assistant", parent_tool_use_id="t9", message={"content": [
+            {"type": "tool_use", "id": "t3", "name": "Grep", "input": {"pattern": "x"}}]})
+        self.assertEqual(core.parse_line(agent), [("activity", "subagente · Grep x…")])
+
+    def test_permisos_limites_y_uso(self):
+        ask = line(type="control_request", request_id="r1", request={
+            "subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "pytest -q"},
+            "description": "Correr las pruebas"})
+        kind, data = core.parse_line(ask)[0]
+        self.assertEqual((kind, data["id"], data["tool"], data["summary"], data["description"]),
+                         ("permission", "r1", "Bash", "Bash pytest -q", "Correr las pruebas"))
+        self.assertEqual(core.parse_line(line(type="control_request", request_id="r2",
+                                              request={"subtype": "otra"})), [])
+        self.assertEqual(core.parse_line(line(type="control_response", response={})), [])
+        info = {"status": "rejected", "rateLimitType": "five_hour", "resetsAt": 1000}
+        self.assertEqual(core.parse_line(line(type="rate_limit_event", rate_limit_info=info)),
+                         [("limit", info)])
+        self.assertEqual(core.parse_line(line(type="rate_limit_event",
+                                              rate_limit_info={"status": "allowed"})), [])
+        message = line(type="assistant", message={"content": [], "usage": {
+            "input_tokens": 10, "cache_read_input_tokens": 70000,
+            "cache_creation_input_tokens": 5000, "output_tokens": 990}})
+        self.assertEqual(core.parse_line(message), [("usage", 76000)])
+
     def test_ignora_subagentes_y_ruido(self):
         sub = line(type="stream_event", parent_tool_use_id="t9", event={
             "type": "content_block_delta", "delta": {"type": "text_delta", "text": "x"}})
@@ -52,6 +93,136 @@ class Helpers(unittest.TestCase):
         self.assertIn("--no-session-persistence", args)
         self.assertEqual(args[-1], "--x")
         self.assertNotIn("--effort", args)
+
+    def test_nota_del_modo_del_chat(self):
+        args = core.build_args("claude", "Read", system="nota")
+        self.assertEqual(args[args.index("--append-system-prompt") + 1], "nota")
+        self.assertNotIn("--append-system-prompt", core.build_args("claude", "Read"))
+        read = core.chat_note("Read,Grep,Glob", False)
+        self.assertIn("Read, Grep, Glob", read)
+        self.assertIn("sólo lectura", read)
+        self.assertIn("No puedes ejecutar comandos", read)
+        edit = core.chat_note("Read,Edit,Bash", True)
+        self.assertIn("edición activada", edit)
+        self.assertNotIn("No puedes ejecutar comandos", edit)
+
+    def test_pliegues_de_un_diff(self):
+        text = "\n".join([
+            "### Cambios en 2 archivos", "```diff",
+            "--- a/uno.py", "+++ b/uno.py", "@@ -1,3 +1,3 @@",
+            " ```", "---- era un comentario SQL", "+nueva",
+            "--- /dev/null", "+++ b/dos.py", "@@ -0,0 +1,2 @@", "+a", "+b",
+            "```", "+ esto ya no es diff"])
+        folds = core.diff_folds(text)
+        self.assertEqual([fold[2:] for fold in folds], [(1, 1), (2, 0)])
+        self.assertEqual(
+            [text[a:b] for a, b, _, _ in folds],
+            ["\n@@ -1,3 +1,3 @@\n ```\n---- era un comentario SQL\n+nueva",
+             "\n@@ -0,0 +1,2 @@\n+a\n+b"])
+        self.assertEqual(core.diff_folds("```diff\n--- a/x\n+++ b/x\n```"), [])
+        self.assertEqual(core.diff_folds("sin diff"), [])
+
+    def test_proceso_persistente_y_modos(self):
+        args = core.build_args("claude", "Read", live=True)
+        self.assertEqual(args[args.index("--input-format") + 1], "stream-json")
+        self.assertEqual(args[args.index("--permission-prompt-tool") + 1], "stdio")
+        self.assertNotIn("--input-format", core.build_args("claude", "Read"))
+        self.assertEqual(core.join_tools("Read, Edit", "Bash,Read", ""), "Read,Edit,Bash")
+        plan = core.chat_note("Read,Grep", False, plan=True)
+        self.assertIn("modo plan", plan)
+        self.assertNotIn("sólo lectura", plan)
+        asks = core.chat_note("Read,Edit,Bash", True, asks=True)
+        self.assertIn("aprueba cada uno", asks)
+        self.assertNotIn("aprueba cada uno", core.chat_note("Read,Edit,Bash", True))
+
+    def test_contexto_y_limite_de_uso(self):
+        result = {"modelUsage": {"a": {"contextWindow": 200000}, "b": {"contextWindow": 1000}}}
+        self.assertEqual(core.context_text(76000, result), "contexto 38 %")
+        self.assertEqual(core.context_text(76000, {}), "contexto 76k")
+        self.assertEqual(core.context_text(None, result), "")
+        now = time.mktime((2026, 10, 12, 10, 0, 0, 0, 0, -1))
+        later = time.mktime((2026, 10, 12, 18, 30, 0, 0, 0, -1))
+        tomorrow = time.mktime((2026, 10, 14, 9, 5, 0, 0, 0, -1))
+        self.assertEqual(
+            core.limit_text({"status": "rejected", "rateLimitType": "five_hour",
+                             "resetsAt": later}, now),
+            "límite de uso de 5 horas alcanzado; se restablece a las 18:30")
+        self.assertEqual(
+            core.limit_text({"status": "allowed_warning", "rateLimitType": "seven_day",
+                             "utilization": 0.92, "resetsAt": tomorrow}, now),
+            "límite de uso semanal al 92 %; se restablece el 14-10 a las 09:05")
+        self.assertEqual(core.limit_text({"status": "allowed_warning"}, now),
+                         "límite de uso cerca de agotarse")
+        self.assertEqual(core.limit_text({"status": "allowed"}, now), "")
+
+    def test_diff_del_bufer_contra_el_disco(self):
+        disk = "".join("linea {}\n".format(n) for n in range(200))
+        text = disk.replace("linea 100\n", "linea cien\n")
+        diff = core.buffer_diff(disk, text, "a.py")
+        self.assertIn("--- a/a.py\n+++ b/a.py\n", diff)
+        self.assertIn("-linea 100\n+linea cien", diff)
+        self.assertLess(len(diff), len(text) // 4)
+        self.assertIsNone(core.buffer_diff(disk, disk, "a.py"))
+        self.assertIsNone(core.buffer_diff(None, text, "a.py"))
+        # Si el diff no ahorra nada, mejor el archivo entero.
+        self.assertIsNone(core.buffer_diff("a\n", "b\n", "a.py"))
+
+    def test_pliegues_del_codigo_largo(self):
+        body = ["linea {}".format(n) for n in range(10)]
+        text = "\n".join(["Mira:", "```python"] + body + ["```", "y esto:", "```", "corto", "```",
+                         "```diff"] + body + ["```"])
+        folds = core.code_folds(text, 6)
+        self.assertEqual(len(folds), 1)
+        a, b = folds[0]
+        self.assertEqual(text[a:b], "\n" + "\n".join(body[4:]))
+        self.assertEqual(core.code_folds(text, 10), [])
+        self.assertEqual(core.code_folds(text, 0), [])
+
+    def test_un_diff_largo_conserva_todos_los_archivos(self):
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as backup:
+            for number in range(12):
+                path = os.path.join(folder, "m{:02}.py".format(number))
+                with open(path, "w") as handle:
+                    handle.write("".join("vieja {}\n".format(n) for n in range(60)))
+                event = json.dumps({"tool_name": "Edit", "cwd": folder,
+                                    "tool_input": {"file_path": path}})
+                subprocess.run([sys.executable, HOOK, backup], input=event.encode(), check=True)
+                with open(path, "w") as handle:
+                    handle.write("".join("nueva {}\n".format(n) for n in range(60)))
+            report = core.edits_report(backup, folder)
+            self.assertEqual(len(report["changed"]), 12)
+            self.assertTrue(report["truncated"])
+            # Los doce figuran, cada uno con su comienzo y cuánto falta.
+            self.assertEqual(report["diff"].count("\n+++ b/m"), 12)
+            self.assertIn("\n… 90 líneas más\n--- a/m01.py", report["diff"])
+            self.assertLessEqual(len(report["diff"].splitlines()), 400 + 12)
+            # Los totales son los de la edición completa, no los de lo que se muestra.
+            self.assertEqual((report["added"], report["removed"]), (720, 720))
+            folds = core.diff_folds("```diff\n{}\n```".format(report["diff"]))
+            self.assertEqual(len(folds), 12)
+
+    def test_revertir_un_solo_archivo(self):
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as root:
+            backup = os.path.join(root, "vivo")
+            paths = [os.path.join(folder, name) for name in ("uno.py", "dos.py")]
+            for path in paths:
+                with open(path, "w") as handle:
+                    handle.write("antes\n")
+                event = json.dumps({"tool_name": "Edit", "cwd": folder,
+                                    "tool_input": {"file_path": path}})
+                subprocess.run([sys.executable, HOOK, backup], input=event.encode(), check=True)
+                with open(path, "w") as handle:
+                    handle.write("despues\n")
+            self.assertEqual(core.edited_files(backup), paths)
+            final = core.rotate_backup(backup, os.path.join(root, "turno"))
+            self.assertEqual((os.listdir(backup), core.edited_files(final)), ([], paths))
+            core.mark_applied(final)
+            self.assertEqual(core.revert_edits(final, [paths[1]]), [paths[1]])
+            with open(paths[0]) as one, open(paths[1]) as two:
+                self.assertEqual((one.read(), two.read()), ("despues\n", "antes\n"))
+            # Lo ya revertido no figura como pendiente ni como «cambió después».
+            self.assertEqual(core.edited_files(final), [paths[0]])
+            self.assertEqual(core.changed_since(final), [])
 
     def test_quita_el_bloque_de_codigo(self):
         self.assertEqual(core.strip_fences("```python\nx = 1\n```\n"), "x = 1")
@@ -292,6 +463,124 @@ class Extras(unittest.TestCase):
         self.assertEqual([name for name, _ in healthy], ["web", "api", "nginx.service"])
 
 
+FAKE_CLI = r'''
+import json, sys
+def out(**event):
+    sys.stdout.write(json.dumps(event) + "\n"); sys.stdout.flush()
+turn = 0
+for raw in sys.stdin:
+    event = json.loads(raw)
+    if event["type"] == "control_request":
+        out(type="control_response", response={"subtype": "success",
+            "request_id": event["request_id"], "response": {"still_queued": []}})
+        out(type="result", result="", is_error=False, subtype="interrupted")
+        continue
+    if event["type"] != "user":
+        continue
+    turn += 1
+    text = event["message"]["content"]
+    out(type="system", subtype="init", session_id="s1")
+    if text == "cuelga":
+        continue
+    if text.startswith("corre"):
+        out(type="control_request", request_id="p%d" % turn, request={
+            "subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "ls"}})
+        answer = json.loads(sys.stdin.readline())["response"]["response"]
+        text = "%s %s" % (answer["behavior"], json.dumps(answer.get("updatedInput")))
+    out(type="stream_event", event={"type": "content_block_delta",
+        "delta": {"type": "text_delta", "text": "%d:%s" % (turn, text)}})
+    out(type="result", result=text, is_error=False)
+'''
+
+
+class LiveSession(unittest.TestCase):
+    """La sesión persistente contra un CLI de mentira que habla el mismo protocolo."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp(prefix="claude-st-live-")
+        self.addCleanup(__import__("shutil").rmtree, self.folder, True)
+        script = os.path.join(self.folder, "cli.py")
+        with open(script, "w") as handle:
+            handle.write(FAKE_CLI)
+        self.session = core.Session([sys.executable, script], self.folder)
+        self.session.start()
+        self.addCleanup(self.session.close)
+
+    def ask(self, prompt, on_permission=None, stop=False):
+        events, done, exit_info = [], threading.Event(), {}
+
+        def on_event(kind, data):
+            events.append((kind, data))
+            if kind == "permission" and on_permission:
+                on_permission(data)
+
+        def on_exit(code, stderr, stopped):
+            exit_info.update(code=code, stopped=stopped)
+            done.set()
+
+        turn = self.session.ask(prompt, on_event, on_exit)
+        if stop:
+            turn.stop()
+        self.assertTrue(done.wait(20), "el turno no terminó")
+        return events, exit_info
+
+    def test_un_mismo_proceso_atiende_varios_mensajes(self):
+        pid = self.session.proc.pid
+        events, exit_info = self.ask("hola")
+        self.assertEqual(exit_info, {"code": 0, "stopped": False})
+        self.assertEqual(events[0], ("session", "s1"))
+        self.assertIn(("text", "1:hola"), events)
+        events, _ = self.ask("otra vez")
+        self.assertIn(("text", "2:otra vez"), events)
+        self.assertTrue(self.session.alive())
+        self.assertEqual(self.session.proc.pid, pid)
+        self.assertFalse(self.session.busy())
+
+    def test_pide_permiso_y_recibe_la_respuesta(self):
+        def allow(data):
+            self.assertEqual((data["tool"], data["summary"]), ("Bash", "Bash ls"))
+            self.session.answer(data["id"], True, data["input"])
+        events, _ = self.ask("corre ls", allow)
+        self.assertIn(("text", '1:allow {"command": "ls"}'), events)
+        events, _ = self.ask("corre ls", lambda data: self.session.answer(data["id"], False))
+        self.assertIn(("text", "2:deny null"), events)
+        # Lo permitido para toda la conversación ya no se pregunta.
+        self.session.allowed.add("Bash")
+        events, _ = self.ask("corre ls", lambda data: self.fail("no debía preguntar"))
+        self.assertIn(("text", '3:allow {"command": "ls"}'), events)
+        self.assertNotIn("permission", [kind for kind, _ in events])
+
+    def test_detener_interrumpe_el_turno_sin_matar_el_proceso(self):
+        _, exit_info = self.ask("cuelga", stop=True)
+        self.assertEqual(exit_info, {"code": 0, "stopped": True})
+        self.assertTrue(self.session.alive())
+        events, _ = self.ask("sigo")
+        self.assertIn(("text", "2:sigo"), events)
+
+    def test_si_el_proceso_muere_el_turno_termina_con_su_codigo(self):
+        done, exit_info = threading.Event(), {}
+        self.session.ask("cuelga", lambda kind, data: None,
+                         lambda code, err, stopped: (exit_info.update(code=code), done.set()))
+        self.session.close()
+        self.assertTrue(done.wait(20))
+        self.assertNotEqual(exit_info["code"], 0)
+        self.assertFalse(self.session.alive())
+        # Un mensaje a un proceso muerto no deja el chat esperando para siempre.
+        again = {}
+        self.session.ask("hola", lambda kind, data: None,
+                         lambda code, err, stopped: again.update(code=code, err=err))
+        self.assertEqual(again["code"], 1)
+
+    def test_un_cli_que_no_arranca_no_deja_eventos(self):
+        session = core.Session([sys.executable, "-c", "import sys; sys.exit(3)"], self.folder)
+        session.start()
+        done, exit_info = threading.Event(), {}
+        session.ask("hola", lambda kind, data: None,
+                    lambda code, err, stopped: (exit_info.update(code=code), done.set()))
+        self.assertTrue(done.wait(20))
+        self.assertEqual((session.events, bool(exit_info["code"])), (0, True))
+
+
 @unittest.skipIf(os.environ.get("CLAUDE_ST_OFFLINE") or not core.find_claude(),
                  "necesita el CLI de Claude")
 class EndToEnd(unittest.TestCase):
@@ -323,6 +612,43 @@ class EndToEnd(unittest.TestCase):
         streamed = "".join(data for kind, data in events if kind == "text")
         self.assertIn("zarzamora-42", streamed)
         self.assertIn("zarzamora-42", events[-1][1]["result"])
+
+    def test_la_sesion_viva_recuerda_y_ejecuta_con_permiso(self):
+        with tempfile.TemporaryDirectory() as folder:
+            args = core.build_args(core.find_claude(), "Read,Bash",
+                                   permission_mode="acceptEdits", persist=False, live=True)
+            session = core.Session(args, folder)
+            session.start()
+            self.addCleanup(session.close)
+
+            def ask(prompt):
+                events, asked, done, info = [], [], threading.Event(), {}
+
+                def on_event(kind, data):
+                    events.append((kind, data))
+                    if kind == "permission":
+                        asked.append(data["tool"])
+                        session.answer(data["id"], True, data["input"])
+
+                def on_exit(code, stderr, stopped):
+                    info.update(code=code, stderr=stderr)
+                    done.set()
+
+                session.ask(prompt, on_event, on_exit)
+                self.assertTrue(done.wait(180), "claude no terminó")
+                self.assertEqual(info["code"], 0, info["stderr"])
+                return events, asked
+
+            ask("Recuerda esta clave: zarzamora-42. Responde sólo «anotado».")
+            pid = session.proc.pid
+            events, _ = ask("¿Cuál era la clave? Responde sólo con la clave.")
+            self.assertIn("zarzamora-42", events[-1][1]["result"])
+            self.assertEqual(session.proc.pid, pid)
+            events, asked = ask("Ejecuta con Bash exactamente `echo hola-$((40+2))` y responde "
+                                "sólo con lo que imprime.")
+            self.assertIn("hola-42", events[-1][1]["result"])
+            # Si tus ajustes de Claude Code ya permiten ese comando, no pregunta.
+            self.assertIn(asked, ([], ["Bash"]))
 
     def test_el_hook_respalda_lo_que_claude_edita(self):
         python = __import__("shutil").which("python3")

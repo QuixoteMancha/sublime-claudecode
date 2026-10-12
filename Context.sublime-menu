@@ -8,6 +8,10 @@
 				"command": "claude_chat"
 			},
 			{
+				"caption": "Abrir otro chat",
+				"command": "claude_another_chat"
+			},
+			{
 				"caption": "Chat nuevo (olvidar la conversación)",
 				"command": "claude_new_chat"
 			},
@@ -22,6 +26,18 @@
 			{
 				"caption": "Permitir o impedir que el chat edite archivos",
 				"command": "claude_toggle_edit"
+			},
+			{
+				"caption": "Dejar un mensaje en cola…",
+				"command": "claude_queue_message"
+			},
+			{
+				"caption": "Elegir modo del chat (lectura, plan, edición)…",
+				"command": "claude_chat_mode"
+			},
+			{
+				"caption": "Plegar o desplegar los bloques del chat",
+				"command": "claude_toggle_diffs"
 			},
 			{
 				"caption": "Elegir modelo…",

@@ -69,6 +69,13 @@
 	{
 		"keys": [
 			"ctrl+alt+c",
+			"y"
+		],
+		"command": "claude_another_chat"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
 			"n"
 		],
 		"command": "claude_new_chat"
@@ -93,6 +100,27 @@
 			"m"
 		],
 		"command": "claude_toggle_edit"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"q"
+		],
+		"command": "claude_queue_message"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"u"
+		],
+		"command": "claude_chat_mode"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
+			"k"
+		],
+		"command": "claude_toggle_diffs"
 	},
 	{
 		"keys": [

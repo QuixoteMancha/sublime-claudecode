@@ -50,6 +50,7 @@ class View(object):
         self._sel, self._settings = Selection([Region(0)]), Settings()
         self.status, self.read_only, self.changes, self.name = {}, False, 0, ""
         self.valid, self.undo_cleared, self.undo_stack = True, 0, []
+        self.folds = []
 
     def id(self): return self._id
     def window(self): return self._window
@@ -72,6 +73,21 @@ class View(object):
     def set_status(self, key, value): self.status[key] = value
     def erase_status(self, key): self.status.pop(key, None)
     def show(self, point): pass
+    def folded_regions(self): return list(self.folds)
+
+    def fold(self, regions):
+        self.folds.extend(regions if isinstance(regions, list) else [regions])
+
+    def unfold(self, region):
+        self.folds = [fold for fold in self.folds
+                      if (fold.begin(), fold.end()) != (region.begin(), region.end())]
+
+    def visible(self):
+        """El texto como se ve, con «…» en lugar de cada pliegue."""
+        text = self.text
+        for fold in sorted(self.folds, key=Region.begin, reverse=True):
+            text = text[:fold.begin()] + "…" + text[fold.end():]
+        return text
     def clear_undo_stack(self):
         self.undo_cleared += 1
         del self.undo_stack[:]
@@ -147,7 +163,7 @@ class Window(object):
     def find_output_panel(self, name): return self.panels.get(name)
     def status_message(self, message): self.messages.append(message)
     def show_input_panel(self, caption, initial, on_done, a, b): self.inputs.append(on_done)
-    def show_quick_panel(self, items, on_select): self.quick.append((items, on_select))
+    def show_quick_panel(self, items, on_select, flags=0): self.quick.append((items, on_select))
 
     def run_command(self, name, args=None):
         self.commands.append((name, args))
@@ -169,7 +185,9 @@ class Window(object):
 sublime = types.ModuleType("sublime")
 sublime.Region = Region
 sublime.ENCODED_POSITION = 1
-sublime.set_timeout = lambda function, delay=0: function()
+timers = []  # lo programado con retardo no corre solo: la prueba decide cuándo
+sublime.set_timeout = lambda function, delay=0: (
+    timers.append(function) if delay else function())
 sublime.error_message = errors.append
 clipboard, dialogs = [""], {"answer": True, "shown": []}
 sublime.get_clipboard = lambda: clipboard[0]
@@ -184,7 +202,10 @@ sublime.save_settings = saved_settings.append
 SETTINGS = Settings(
     claude_path="claude", read_tools="Read,Grep,Glob", edit_tools="Read,Edit,Write,Grep,Glob",
     extra_args=[], model="", effort="", chat_position="right", review_edits=True,
-    remote_host="servidor", remote_log_lines=50)
+    remote_host="servidor", remote_log_lines=50,
+    # Casi todas las pruebas describen el modo de un proceso por mensaje, que sigue
+    # siendo el de reserva; las del proceso persistente lo encienden ellas.
+    persistent_chat=False)
 sublime.load_settings = lambda name: SETTINGS
 sublime_plugin = types.ModuleType("sublime_plugin")
 
@@ -221,6 +242,8 @@ class FakeRunner(object):
         return self.args[self.args.index(name) + 1]
 
     def play(self, script=ANSWER, code=0, stderr="", stopped=False):
+        if getattr(self, "session", None) is not None:
+            self.session.events += len(script)
         for kind, data in script:
             self.on_event(kind, data)
         self.on_exit(code, stderr, stopped)
@@ -229,7 +252,35 @@ class FakeRunner(object):
         self.play([], stopped=True)
 
 
+class FakeSession(object):
+    """El proceso persistente: cada mensaje es un FakeRunner más, con sus mismos argumentos."""
+    made = []
+
+    def __init__(self, args, cwd):
+        self.args, self.cwd = args, cwd
+        self.events, self.allowed, self.answers, self.dead = 0, set(), [], False
+        FakeSession.made.append(self)
+
+    def start(self):
+        pass
+
+    def alive(self):
+        return not self.dead
+
+    def close(self):
+        self.dead = True
+
+    def answer(self, request_id, allow, tool_input=None, message=""):
+        self.answers.append((request_id, allow, tool_input))
+
+    def ask(self, prompt, on_event, on_exit):
+        turn = FakeRunner(self.args, self.cwd, prompt, on_event, on_exit)
+        turn.session = self
+        return turn
+
+
 plugin.core.Runner = FakeRunner
+plugin.core.Session = FakeSession
 plugin.core.find_claude = lambda configured=None: "/bin/claude"
 plugin._background = lambda function: function()
 
@@ -238,10 +289,15 @@ class ChatTest(unittest.TestCase):
     def setUp(self):
         FakeRunner.calls[:] = []
         plugin._runners.clear()
+        plugin._sessions.clear()
+        plugin._queued.clear()
+        del plugin._live_off[:]
         plugin._last_file.clear()
+        plugin._last_chat.clear()
         plugin._transcripts.clear()
         plugin._restoring.clear()
         plugin._testing.clear()
+        del timers[:]
         __import__("shutil").rmtree(plugin._history_dir(), True)
         SETTINGS["model"] = ""
         del errors[:]
@@ -374,6 +430,436 @@ class ChatTest(unittest.TestCase):
         self.last.play()
         self.assertTrue(self.chat.text.endswith("\n\n❯ a medio escribir"))
         self.assertEqual(self.chat.text[self.chat.settings()[plugin.K_START]:], "a medio escribir")
+
+    def test_el_chat_muestra_que_hace_mientras_no_llega_texto(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("revisa esto")
+        chat = self.chat
+        self.assertTrue(chat.text.endswith("❯ revisa esto\n  ⋯ esperando la respuesta…\n"))
+        self.assertEqual(self.file.status, {})
+        self.assertEqual(chat.status[plugin.STATUS_KEY], "Claude: esperando la respuesta…")
+        self.last.on_event("activity", "pensando…")
+        self.assertTrue(chat.text.endswith("❯ revisa esto\n  ⋯ pensando…\n"))
+        self.assertEqual(chat.status[plugin.STATUS_KEY], "Claude: pensando…")
+        self.last.on_event("activity", "preparando Read…")
+        self.assertEqual(chat.text.count("⋯"), 1)
+        self.assertTrue(chat.read_only)
+        self.last.play([("tool", "Read src/a.py"), ("activity", "esperando la respuesta…"),
+                        ("text_start", None), ("text", "Listo."),
+                        ("result", {"result": "x", "is_error": False})])
+        # La línea de actividad no deja rastro en la conversación.
+        self.assertNotIn("⋯", chat.text)
+        self.assertIn("❯ revisa esto\n  ⚙ Read src/a.py\n\nListo.\n\n— listo (", chat.text)
+        self.assertEqual(chat.status, {})
+
+    def test_la_espera_cuenta_los_segundos(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("revisa esto")
+        chat = self.chat
+        self.assertEqual(len(timers), 1)
+        self.last.on_event("activity", "pensando…")
+        timers.pop()()
+        self.assertTrue(chat.text.endswith("❯ revisa esto\n  ⋯ pensando… 0 s\n"))
+        self.assertEqual(chat.status[plugin.STATUS_KEY], "Claude: pensando… 0 s")
+        # Mientras escribe la respuesta no hay nada que contar.
+        self.last.on_event("text_start", None)
+        self.last.on_event("text", "Listo.")
+        timers.pop()()
+        self.assertTrue(chat.text.endswith("❯ revisa esto\n\nListo."))
+        self.last.play([("result", {"result": "x", "is_error": False})])
+        timers.pop()()
+        self.assertEqual(timers, [])
+        self.assertNotIn("⋯", chat.text)
+
+    def test_sin_plegar_el_diff_queda_abierto(self):
+        SETTINGS["fold_edits"] = False
+        self.addCleanup(SETTINGS.pop, "fold_edits")
+        folder, path = self.project()
+        plugin.ClaudeEditFileCommand(self.window).run()
+        self.window.inputs[-1]("devuelve cero")
+        self.claude_edits(path, "def f():\n    return 0\n")
+        self.last.play()
+        self.assertEqual(self.chat.folds, [])
+        self.assertNotIn("plegado", self.chat.text)
+        plugin.ClaudeToggleDiffsCommand(self.window).run()
+        self.assertNotIn("return 1/0", self.chat.visible())
+
+    def test_detener_borra_la_linea_de_actividad(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("revisa esto")
+        self.last.stop()
+        self.assertNotIn("⋯", self.chat.text)
+        self.assertIn("❯ revisa esto\n\n— detenido\n", self.chat.text)
+
+    def test_claude_sabe_si_el_chat_puede_editar(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("arregla la división")
+        note = self.last.option("--append-system-prompt")
+        self.assertIn("sólo lectura", note)
+        self.assertIn("Ctrl+Alt+C, M", note)
+        self.last.play()
+        self.assertRegex(self.chat.text, r"— listo \(\d+ s\) · sólo lectura\n")
+        plugin.ClaudeToggleEditCommand(self.window).run()
+        self.assertTrue(self.chat.text.endswith("— el chat ahora puede editar archivos\n\n❯ "))
+        self.say("ahora sí")
+        note = self.last.option("--append-system-prompt")
+        self.assertIn("edición activada", note)
+        self.assertNotIn("sólo lectura", note)
+        self.last.play()
+        self.assertRegex(self.chat.text, r"— listo \(\d+ s\) · puede editar\n")
+        # Las consultas que no vienen del chat traen sus propias instrucciones.
+        plugin.ClaudeReviewFileCommand(self.window).run()
+        self.assertNotIn("--append-system-prompt", self.last.args)
+
+    def test_cambiar_el_modo_a_media_respuesta_no_parte_el_texto(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("revisa esto")
+        before = self.chat.text
+        plugin.ClaudeToggleEditCommand(self.window).run()
+        self.assertEqual(self.chat.text, before)
+        self.assertEqual(self.chat.name, "Claude ✎")
+
+    def test_el_chat_puede_nacer_con_edicion(self):
+        SETTINGS["chat_edit_default"] = True
+        self.addCleanup(SETTINGS.pop, "chat_edit_default")
+        plugin.ClaudeChatCommand(self.window).run()
+        self.assertEqual((self.chat.name, self.chat.text), ("Claude ✎", "❯ "))
+        self.say("arregla la división")
+        self.assertEqual(self.last.option("--permission-mode"), "acceptEdits")
+
+    # --- Proceso persistente, permisos y cola --------------------------------
+
+    def live(self):
+        SETTINGS["persistent_chat"] = True
+        self.addCleanup(SETTINGS.__setitem__, "persistent_chat", False)
+        FakeSession.made[:] = []
+
+    def test_el_proceso_persistente_sirve_para_toda_la_conversacion(self):
+        self.live()
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("hola")
+        self.assertEqual(self.last.option("--input-format"), "stream-json")
+        self.assertEqual(self.last.option("--permission-prompt-tool"), "stdio")
+        self.last.play()
+        self.say("¿y ahora?")
+        self.assertEqual(len(FakeSession.made), 1)
+        self.assertEqual(self.last.prompt, "¿y ahora?")
+        self.assertNotIn("--resume", self.last.args)
+        self.last.play([("session", "s1"), ("text_start", None), ("text", "Sigo."),
+                        ("result", {"result": "x", "is_error": False})])
+        self.assertIn("❯ ¿y ahora?\n\nSigo.\n\n— listo (", self.chat.text)
+
+        # Otro modo son otras herramientas: proceso nuevo, que retoma la conversación.
+        plugin.ClaudeToggleEditCommand(self.window).run()
+        self.say("arréglalo")
+        self.assertEqual(len(FakeSession.made), 2)
+        self.assertTrue(FakeSession.made[0].dead)
+        self.assertEqual(self.last.option("--resume"), "s1")
+        self.assertEqual(self.last.option("--tools"), "Read,Edit,Write,Grep,Glob,Bash")
+        self.assertIn("aprueba cada uno", self.last.option("--append-system-prompt"))
+        self.last.play()
+
+        plugin.ClaudeNewChatCommand(self.window).run()
+        self.assertTrue(FakeSession.made[1].dead)
+        self.assertEqual(plugin._sessions, {})
+        self.say("otra conversación")
+        self.assertEqual(len(FakeSession.made), 3)
+        self.assertNotIn("--resume", self.last.args)
+
+    def test_cerrar_el_chat_cierra_su_proceso(self):
+        self.live()
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("hola")
+        self.last.play()
+        plugin.ClaudeChatListener(self.chat).on_pre_close()
+        self.assertTrue(FakeSession.made[0].dead)
+        self.assertEqual(plugin._sessions, {})
+
+    def test_claude_pide_permiso_y_decide_quien_esta_en_el_editor(self):
+        self.live()
+        plugin.ClaudeChatCommand(self.window).run()
+        plugin.ClaudeToggleEditCommand(self.window).run()
+        self.say("corre las pruebas")
+        chat, session = self.chat, FakeSession.made[0]
+
+        def ask(request_id):
+            data = {"id": request_id, "tool": "Bash", "input": {"command": "pytest   -q"},
+                    "summary": "Bash pytest -q", "description": "", "blocked_path": ""}
+            self.last.on_event("permission", data)
+            return self.window.quick[-1]
+
+        items, decide = ask("r1")
+        self.assertEqual(items[0], ["Permitir", "Bash pytest -q"])
+        self.assertIn("«Bash»", items[1][0])
+        self.assertTrue(chat.text.endswith(
+            "  ? pide permiso: Bash pytest -q\n  ⋯ esperando tu permiso…\n"))
+        decide(0)
+        self.assertEqual(session.answers, [("r1", True, {"command": "pytest   -q"})])
+        self.assertNotIn("rechazado", chat.text)
+
+        # Cerrar el panel sin elegir es no dar permiso.
+        ask("r2")[1](-1)
+        self.assertEqual(session.answers[-1][:2], ("r2", False))
+        self.assertIn("  ✘ rechazado\n", chat.text)
+
+        ask("r3")[1](1)
+        self.assertEqual((session.answers[-1][:2], session.allowed), (("r3", True), {"Bash"}))
+
+        # Un guion largo no se vuelca en un renglón: primera línea y el resto plegado.
+        script = "cat > check.py <<'EOF'\nimport sys\nprint(sys.argv)\nEOF\npython3 check.py"
+        self.last.on_event("permission", {
+            "id": "r5", "tool": "Bash", "input": {"command": script},
+            "summary": "Bash cat > check.py <<'EOF' import sys", "description": "",
+            "blocked_path": ""})
+        items, decide = self.window.quick[-1]
+        self.assertEqual(items[0], ["Permitir", "Bash cat > check.py <<'EOF'"])
+        self.assertIn("  ? pide permiso: Bash cat > check.py <<'EOF' … (5 líneas, completo aquí "
+                      "abajo)\n```bash…\n```\n  ⋯ esperando tu permiso…\n", chat.visible())
+        self.assertIn("```bash\n{}\n```\n".format(script), chat.text)
+        decide(0)
+        self.assertEqual(session.answers[-1], ("r5", True, {"command": script}))
+
+        late = ask("r4")[1]
+        self.last.play()
+        after = chat.text
+        late(2)  # la respuesta ya terminó: no se escribe nada fuera de lugar
+        self.assertEqual(chat.text, after)
+        self.assertNotIn("⋯", chat.text)
+
+    def test_si_el_proceso_persistente_no_arranca_se_vuelve_al_modo_de_siempre(self):
+        self.live()
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("hola")
+        prompt = self.last.prompt
+        FakeSession.made[0].dead = True
+        self.last.on_exit(1, "error: unknown option '--input-format'", False)
+        self.assertEqual(len(FakeRunner.calls), 2)
+        self.assertNotIn("--input-format", self.last.args)
+        self.assertEqual(self.last.prompt, prompt)
+        self.assertIn("— el proceso persistente no arrancó", self.chat.text)
+        self.last.play()
+        self.assertIn("— listo (", self.chat.text)
+        self.say("sigo")
+        self.assertEqual(len(FakeSession.made), 1)
+        self.assertEqual(self.last.option("--resume"), "s1")
+
+    def test_un_proceso_que_muere_a_media_conversacion_se_repone(self):
+        self.live()
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("hola")
+        self.last.play()
+        FakeSession.made[0].dead = True
+        self.say("sigo")
+        self.assertEqual(len(FakeSession.made), 2)
+        self.assertEqual(self.last.option("--resume"), "s1")
+        # Murió después de haber funcionado: es un error, no motivo para dejar el modo.
+        FakeSession.made[1].events = 3
+        FakeSession.made[1].dead = True
+        self.last.on_exit(137, "", False)
+        self.assertIn("**Error** (código 137)", self.chat.text)
+        self.assertEqual(plugin._live_off, [])
+
+    def test_una_edicion_por_turno_con_el_proceso_persistente(self):
+        self.live()
+        folder, path = self.project()
+        plugin.ClaudeEditFileCommand(self.window).run()
+        self.window.inputs[-1]("devuelve cero")
+        self.claude_edits(path, "def f():\n    return 0\n")
+        self.last.play()
+        chat = self.chat
+        self.assertIn("-    return 1/0\n+    return 0\n```\n", chat.text)
+        first = chat.settings()[plugin.K_BACKUP]
+        self.say("mejor que devuelva uno")
+        self.assertEqual(len(FakeSession.made), 1)
+        self.claude_edits(path, "def f():\n    return 1\n")
+        self.last.play()
+        # El diff es el de este turno, no el acumulado desde que arrancó el proceso.
+        self.assertIn("-    return 0\n+    return 1\n```\n", chat.text)
+        self.assertNotEqual(chat.settings()[plugin.K_BACKUP], first)
+        plugin.ClaudeRevertEditCommand(self.window).run()
+        with open(path) as handle:
+            self.assertEqual(handle.read(), "def f():\n    return 0\n")
+
+    def test_un_mensaje_en_cola_se_envia_al_terminar(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("uno")
+        self.chat.run_command("claude_chat_send")   # Enter mientras responde
+        self.window.inputs[-1]("dos")
+        self.assertIn("1 mensaje en cola", self.window.messages[-1])
+        self.assertEqual(len(FakeRunner.calls), 1)
+        self.last.play()
+        self.assertEqual(len(FakeRunner.calls), 2)
+        self.assertEqual((self.last.prompt, self.last.option("--resume")), ("dos", "s1"))
+        self.assertTrue(self.chat.text.endswith("\n\n❯ dos\n  ⋯ esperando la respuesta…\n"))
+        self.assertEqual(plugin._queued, {})
+
+    def test_al_detener_lo_que_estaba_en_cola_vuelve_al_borrador(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("uno")
+        plugin.ClaudeQueueMessageCommand(self.window).run()
+        self.window.inputs[-1]("dos")
+        self.last.stop()
+        self.assertEqual(len(FakeRunner.calls), 1)
+        self.assertTrue(self.chat.text.endswith("— detenido\n\n❯ dos"))
+        self.assertEqual(plugin._queued, {})
+
+    # --- Modos, varios chats y cierre de turno -------------------------------
+
+    def test_modo_plan(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        plugin.ClaudeChatModeCommand(self.window).run()
+        items, choose = self.window.quick[-1]
+        self.assertEqual([item[0] for item in items], ["● Sólo lectura", "Plan", "Edición"])
+        choose(1)
+        self.assertEqual(self.chat.name, "Claude ◇")
+        self.assertTrue(self.chat.text.endswith("— el chat está en modo plan: propone y no modifica\n\n❯ "))
+        self.say("¿cómo lo harías?")
+        self.assertEqual(self.last.option("--permission-mode"), "plan")
+        self.assertEqual(self.last.option("--tools"), "Read,Grep,Glob")
+        self.assertIn("modo plan", self.last.option("--append-system-prompt"))
+        self.last.play()
+        self.assertRegex(self.chat.text, r"— listo \(\d+ s\) · modo plan\n")
+        plugin.ClaudeToggleEditCommand(self.window).run()
+        self.assertEqual(self.chat.name, "Claude ✎")
+        self.say("adelante")
+        self.assertEqual(self.last.option("--permission-mode"), "acceptEdits")
+
+    def test_dos_chats_trabajan_a_la_vez(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        first = self.chat
+        self.say("uno")
+        plugin.ClaudeAnotherChatCommand(self.window).run()
+        second = self.chat
+        self.assertIsNot(first, second)
+        self.assertEqual((first.name, second.name), ("Claude", "Claude 2"))
+        self.say("dos")
+        self.assertEqual((len(FakeRunner.calls), len(plugin._runners)), (2, 2))
+        self.assertNotIn("--resume", self.last.args)
+        # «Detener» corta el chat en uso; el otro sigue.
+        plugin.ClaudeStopCommand(self.window).run()
+        self.assertTrue(second.text.endswith("— detenido\n\n❯ "))
+        self.assertTrue(first.read_only)
+        FakeRunner.calls[0].play()
+        self.assertIn("— listo (", first.text)
+        self.assertEqual(plugin._runners, {})
+        self.assertNotIn("Miro el archivo", second.text)
+        # Los comandos responden en el último chat que se usó.
+        self.window.focus_view(self.file)
+        self.assertIs(self.chat, second)
+        self.window.focus_view(first)
+        self.window.focus_view(self.file)
+        plugin.ClaudeReviewFileCommand(self.window).run()
+        self.assertIn("## Revisión · src/a.py", first.text)
+        self.assertNotIn("## Revisión", second.text)
+
+    def test_revertir_un_solo_archivo_de_la_edicion(self):
+        folder, path = self.project()
+        other = os.path.join(folder, "otro.py")
+        with open(other, "w") as handle:
+            handle.write("x = 1\n")
+        plugin.ClaudeEditFileCommand(self.window).run()
+        self.window.inputs[-1]("cambia los dos")
+        self.claude_edits(path, "def f():\n    return 0\n")
+        self.claude_edits(other, "x = 2\n")
+        self.last.play()
+        chat = self.chat
+        self.assertIn("### Cambios en 2 archivos\n", chat.text)
+        plugin.ClaudeRevertEditCommand(self.window).run()
+        items, choose = self.window.quick[-1]
+        self.assertEqual([item[0] for item in items],
+                         ["Todos los archivos (2)", "calc.py", "otro.py"])
+        choose(2)
+        with open(path) as one, open(other) as two:
+            self.assertEqual((one.read(), two.read()), ("def f():\n    return 0\n", "x = 1\n"))
+        self.assertTrue(chat.text.endswith(
+            "— edición revertida: otro.py (quedan 1 sin revertir)\n\n❯ "))
+        self.assertIn("parte de tu última edición (otro.py)", chat.settings()[plugin.K_NOTICE])
+        self.assertTrue(plugin.ClaudeRevertEditCommand(self.window).is_enabled())
+        # Queda uno: se revierte sin preguntar cuál.
+        plugin.ClaudeRevertEditCommand(self.window).run()
+        with open(path) as handle:
+            self.assertEqual(handle.read(), "def f():\n    return 1/0\n")
+        self.assertFalse(plugin.ClaudeRevertEditCommand(self.window).is_enabled())
+
+    def test_el_cierre_dice_cuanto_contexto_va_y_avisa_el_limite_una_vez(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("hola")
+        info = {"status": "rejected", "rateLimitType": "five_hour"}
+        warning = {"status": "allowed_warning", "rateLimitType": "seven_day", "utilization": 0.52}
+        self.last.play([
+            ("session", "s1"), ("limit", info), ("limit", info), ("limit", warning),
+            ("limit", dict(warning, utilization=0.53)), ("text_start", None),
+            ("text", "Hola."), ("usage", 76000),
+            ("result", {"result": "x", "is_error": False, "total_cost_usd": 0.5,
+                        "modelUsage": {"m": {"contextWindow": 200000}}})])
+        chat = self.chat
+        self.assertEqual(chat.text.count("— límite de uso de 5 horas alcanzado\n"), 1)
+        # El porcentaje sube durante la conversación: se anota la primera vez.
+        self.assertEqual(chat.text.count("— límite de uso semanal"), 1)
+        self.assertIn("— límite de uso semanal al 52 %\n", chat.text)
+        self.assertIn("al 53 %", self.window.messages[-2])
+        self.assertRegex(chat.text, r"— listo \(\d+ s\) · sólo lectura · contexto 38 %\n")
+        self.assertNotIn("US$", chat.text)
+        SETTINGS["show_cost"] = True
+        self.addCleanup(SETTINGS.pop, "show_cost")
+        self.say("otra")
+        self.last.play([("session", "s1"), ("text_start", None), ("text", "Vale."),
+                        ("result", {"result": "x", "is_error": False, "total_cost_usd": 0.5})])
+        self.assertRegex(chat.text, r"— listo \(\d+ s\) · sólo lectura · US\$ 0\.50\n")
+
+    def test_el_codigo_largo_de_una_respuesta_llega_plegado(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("muéstrame el módulo")
+        code = "\n".join("linea {}".format(n) for n in range(60))
+        self.last.play([("session", "s1"), ("text_start", None),
+                        ("text", "Aquí va:\n```python\n{}\n```\nY uno corto:\n```\nx = 1\n```\n".format(code)),
+                        ("result", {"result": "x", "is_error": False})])
+        chat = self.chat
+        self.assertIn("linea 3…\n```\nY uno corto:\n```\nx = 1\n```", chat.visible())
+        self.assertNotIn("linea 30", chat.visible())
+        plugin.ClaudeToggleDiffsCommand(self.window).run()
+        self.assertEqual(chat.visible(), chat.text)
+        SETTINGS["fold_code_lines"] = 0
+        self.addCleanup(SETTINGS.pop, "fold_code_lines")
+        plugin.ClaudeToggleDiffsCommand(self.window).run()
+        self.assertIn("no hay bloques", self.window.messages[-1])
+
+    def test_un_bufer_con_cambios_sin_guardar_viaja_como_diff(self):
+        folder, path = self.project()
+        disk = "".join("linea {}\n".format(n) for n in range(200))
+        with open(path, "w") as handle:
+            handle.write(disk)
+        self.file.text, self.file.dirty = disk.replace("linea 100\n", "linea cien\n"), True
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("¿qué cambié?")
+        self.assertIn("diff del búfer contra el archivo en disco:\n<diff>\n--- a/calc.py",
+                      self.last.prompt)
+        self.assertIn("-linea 100\n+linea cien", self.last.prompt)
+        self.assertNotIn("<contenido>", self.last.prompt)
+        self.assertNotIn("linea 5\n", self.last.prompt)
+
+    def test_los_avisos_del_linter_viajan_con_el_archivo(self):
+        original = plugin._lsp_lines
+        self.addCleanup(setattr, plugin, "_lsp_lines", original)
+        found = ["src/a.py:2:12: [pyright] división por cero"]
+        plugin._lsp_lines = lambda view, rel, severity: list(found)
+        plugin.ClaudeChatCommand(self.window).run()
+        self.say("revisa")
+        self.assertIn("Avisos del linter en ese archivo:\nsrc/a.py:2:12: [pyright] división",
+                      self.last.prompt)
+        self.last.play()
+        self.say("¿algo más?")     # nada cambió: el contexto no se repite
+        self.assertEqual(self.last.prompt, "¿algo más?")
+        self.last.play()
+        found.append("src/a.py:1:1: [ruff] falta docstring")
+        self.say("¿y ahora?")      # cambiaron los avisos: vuelve a viajar
+        self.assertIn("falta docstring", self.last.prompt)
+        SETTINGS["context_diagnostics"] = False
+        self.addCleanup(SETTINGS.pop, "context_diagnostics")
+        self.last.play()
+        plugin.ClaudeNewChatCommand(self.window).run()
+        self.say("hola")
+        self.assertNotIn("Avisos del linter", self.last.prompt)
 
     def test_editar_deja_el_chat_con_permiso_de_edicion(self):
         self.file.dirty = True
@@ -508,7 +994,13 @@ class ChatTest(unittest.TestCase):
         self.last.play()
         chat = self.chat
         self.assertIn("### Cambios en 1 archivo\n```diff\n--- a/calc.py\n+++ b/calc.py\n", chat.text)
-        self.assertIn("-    return 1/0\n+    return 0\n```\n", chat.text)
+        self.assertIn("-    return 1/0\n+    return 0\n```\n+1 −1 líneas. ", chat.text)
+        # Llega plegado: del archivo se ve el encabezado, no el código.
+        self.assertIn("```diff\n--- a/calc.py\n+++ b/calc.py…\n```\n", chat.visible())
+        plugin.ClaudeToggleDiffsCommand(self.window).run()
+        self.assertEqual(chat.visible(), chat.text)
+        plugin.ClaudeToggleDiffsCommand(self.window).run()
+        self.assertNotIn("return 1/0", chat.visible())
         self.assertLess(chat.text.index("### Cambios"), chat.text.index("— listo"))
         self.assertTrue(plugin.ClaudeRevertEditCommand(self.window).is_enabled())
 

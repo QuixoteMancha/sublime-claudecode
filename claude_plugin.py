@@ -31,6 +31,9 @@ K_EDIT = "claude_can_edit"
 K_CONTEXT = "claude_context"
 K_BACKUP = "claude_last_edit"
 K_NOTICE = "claude_notice"
+K_PLAN = "claude_plan"
+K_NUMBER = "claude_number"
+K_LIMIT = "claude_limit"
 
 HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "snapshot.py")
 REMOTE_LIST = "docker ps -a --format '{{.Names}}\\t{{.Status}}'"
@@ -73,8 +76,8 @@ WRITE_TESTS = (
     "Antes mira cómo están organizadas las pruebas del proyecto (carpeta, nombres, "
     "fixtures) y sigue esa convención; si ya hay un archivo de pruebas para este módulo, "
     "agrégalas ahí. Cubre el caso normal, los casos borde y los errores esperados. No "
-    "modifiques el código que se prueba: si encuentras un bug, déjalo anotado. No puedes "
-    "ejecutar las pruebas, así que al final da el comando para correrlas."
+    "modifiques el código que se prueba: si encuentras un bug, déjalo anotado. Al final da "
+    "el comando para correrlas."
 )
 COMMIT_MESSAGE = (
     "Escribe el mensaje de commit para estos cambios. Sigue el idioma y el estilo de los "
@@ -99,7 +102,7 @@ FIX_TESTS = (
     "Encuentra la causa leyendo el código y las pruebas. Si el bug está en el código, "
     "corrígelo. Si la que está mal es la prueba, no la debilites (nada de skip, xfail ni "
     "ajustar el valor esperado al resultado): explica por qué y no la toques. Al final "
-    "resume qué cambiaste; no puedes volver a correr las pruebas, eso lo hago yo."
+    "resume qué cambiaste; las pruebas las vuelvo a correr yo."
 )
 MODELS = (
     ("", "Predeterminado", "El que tenga configurado Claude Code"),
@@ -115,8 +118,12 @@ WRITE_CODE = (
     "corresponde: sin explicaciones y sin bloque ```."
 )
 
-_runners = {}    # id de ventana -> consulta en curso
+_runners = {}    # «v<id del chat>» o «w<id de ventana>» (consultas sin chat) -> consulta en curso
+_sessions = {}   # id del chat -> proceso de Claude que sigue vivo entre mensajes
+_queued = {}     # id del chat -> mensajes que esperan a que termine la respuesta
+_live_off = []   # por qué se dejó de usar el proceso persistente, si falló al arrancar
 _last_file = {}  # id de ventana -> id de la última pestaña que no es el chat
+_last_chat = {}  # id de ventana -> id del último chat usado
 _transcripts = {}  # id del chat -> conversación hasta la marca, para protegerla
 _restoring = set()
 _testing = set()   # ids de ventana con pytest corriendo
@@ -137,6 +144,7 @@ def _save_history(view):
     try:
         core.history_save(_history_dir(), {
             "session": session, "cwd": state.get(K_CWD), "edit": bool(state.get(K_EDIT)),
+            "plan": bool(state.get(K_PLAN)),
             "title": core.history_title(text), "updated": time.time(), "text": text})
     except OSError:
         pass
@@ -168,21 +176,64 @@ def _file_view(window):
 
 # --- La pestaña de chat -----------------------------------------------------
 
+def _chats(window):
+    return [view for view in window.views() if _is_chat(view)]
+
+
 def _find_chat(window):
-    for view in window.views():
-        if _is_chat(view):
+    """El chat en uso: el que tiene el foco o, si no, el último que lo tuvo."""
+    chats = _chats(window)
+    active = window.active_view()
+    if active is not None and _is_chat(active):
+        return active
+    wanted = _last_chat.get(window.id())
+    for view in chats:
+        if view.id() == wanted:
             return view
+    return chats[0] if chats else None
+
+
+def _slot(window, view=None):
+    return "v{}".format(view.id()) if view is not None else "w{}".format(window.id())
+
+
+def _busy(view):
+    return view is not None and _slot(None, view) in _runners
+
+
+def _current_runner(window):
+    """La consulta que «Detener» corta: la del chat en uso o, si no, la que haya."""
+    chat = _find_chat(window)
+    keys = ([_slot(window, chat)] if chat is not None else []) + [_slot(window)]
+    keys += [_slot(window, view) for view in _chats(window)]
+    for key in keys:
+        if key in _runners:
+            return _runners[key]
     return None
+
+
+def _live_enabled():
+    return bool(_settings().get("persistent_chat", True)) and not _live_off
+
+
+def _drop_session(view_id):
+    live = _sessions.pop(view_id, None)
+    if live is not None:
+        live["session"].close()
+        if live.get("backup"):
+            shutil.rmtree(live["backup"], ignore_errors=True)
 
 
 def _create_chat(window):
     working = _last_file.get(window.id())
+    number = 1 + max([chat.settings().get(K_NUMBER) or 1 for chat in _chats(window)] or [0])
     view = window.new_file()
     view.set_name("Claude")
     view.set_scratch(True)
     view.assign_syntax(SYNTAX)
     settings = view.settings()
     settings.set(CHAT, True)
+    settings.set(K_NUMBER, number)
     # Al nacer, la pestaña todavía no estaba marcada como chat y quedó anotada
     # como archivo de trabajo: se repone el que había.
     if working is None:
@@ -207,6 +258,7 @@ def _create_chat(window):
         group = window.num_groups() - 1
         if window.get_view_index(view)[0] != group:
             window.set_view_index(view, group, len(window.views_in_group(group)))
+    _set_edit(view, _settings().get("chat_edit_default", False))
     _end_turn(view)
     return view
 
@@ -222,6 +274,56 @@ def _write(view, text):
     if text and view.is_valid():
         view.run_command(
             "append", {"characters": text, "force": True, "scroll_to_end": True})
+
+
+def _clear_activity(view, turn):
+    """Borra la línea de actividad: acompaña la espera, no es parte de la respuesta."""
+    line = turn.pop("activity", "")
+    start = view.size() - len(line)
+    if line and view.substr(sublime.Region(start, view.size())) == line:
+        view.set_read_only(False)
+        view.run_command("claude_chat_replace", {"a": start, "b": view.size(), "text": ""})
+        view.set_read_only(True)
+
+
+def _show_activity(view, turn, text):
+    line = "  ⋯ {}\n".format(text)
+    old = turn.get("activity", "")
+    start = view.size() - len(old)
+    if old and view.substr(sublime.Region(start, view.size())) == old:
+        # Se reescribe en su lugar: el contador avanza sin mover lo que se está leyendo.
+        view.set_read_only(False)
+        view.run_command("claude_chat_replace", {"a": start, "b": view.size(), "text": line})
+        view.set_read_only(True)
+    else:
+        _line(view)
+        _write(view, line)
+    turn["activity"] = line
+
+
+def _diff_regions(view, start=0):
+    text = view.substr(sublime.Region(start, view.size()))
+    return [sublime.Region(start + a, start + b) for a, b, _, _ in core.diff_folds(text)]
+
+
+def _code_regions(view, start=0):
+    text = view.substr(sublime.Region(start, view.size()))
+    lines = int(_settings().get("fold_code_lines", 40) or 0)
+    return [sublime.Region(start + a, start + b) for a, b in core.code_folds(text, lines)]
+
+
+def _fold_diffs(view, start=0):
+    """Pliega cada archivo de los diffs: queda el encabezado y se despliega a pedido."""
+    regions = _diff_regions(view, start)
+    if regions and _settings().get("fold_edits", True):
+        view.fold(regions)
+
+
+def _fold_code(view, start=0):
+    """Pliega el código largo de una respuesta, dejando a la vista sus primeras líneas."""
+    regions = _code_regions(view, start)
+    if regions:
+        view.fold(regions)
 
 
 def _tail(view):
@@ -276,21 +378,72 @@ def _end_turn(view, draft=""):
         sublime.set_timeout(lambda: view.is_valid() and view.clear_undo_stack(), 0)
 
 
-def _note(window, text):
+def _note(window, text, view=None):
     """Escribe un aviso suelto en el chat, fuera de una consulta."""
-    view = _open_chat(window)
+    view = view or _open_chat(window)
     draft = _begin_turn(view)
     _block(view)
     _write(view, text)
     _end_turn(view, draft)
 
 
+def _rename(view):
+    state = view.settings()
+    number = state.get(K_NUMBER) or 1
+    view.set_name("Claude{}{}".format(
+        " {}".format(number) if number > 1 else "",
+        " ✎" if state.get(K_EDIT) else " ◇" if state.get(K_PLAN) else ""))
+
+
 def _set_edit(view, enabled):
     view.settings().set(K_EDIT, bool(enabled))
-    view.set_name("Claude ✎" if enabled else "Claude")
+    if enabled:
+        view.settings().erase(K_PLAN)
+    _rename(view)
+
+
+def _set_plan(view, enabled):
+    view.settings().set(K_PLAN, bool(enabled))
+    if enabled:
+        view.settings().set(K_EDIT, False)
+    _rename(view)
+
+
+def _mode_label(view):
+    state = view.settings()
+    return "puede editar" if state.get(K_EDIT) else "modo plan" if state.get(K_PLAN) \
+        else "sólo lectura"
+
+
+def _chat_mode(view):
+    """Con qué se lanza un mensaje del chat: (herramientas, modo de permisos, nota)."""
+    settings, state = _settings(), view.settings()
+    live = _live_enabled()
+    if state.get(K_EDIT):
+        tools = settings.get("edit_tools", core.EDIT_TOOLS)
+        if live:
+            # Lo que necesita aprobación sólo se ofrece si hay quién la pida.
+            tools = core.join_tools(tools, settings.get("ask_tools", "Bash"))
+        return tools, "acceptEdits", core.chat_note(tools, True, asks=live)
+    tools = settings.get("read_tools", core.READ_TOOLS)
+    if state.get(K_PLAN):
+        return tools, "plan", core.chat_note(tools, False, plan=True)
+    return tools, None, core.chat_note(tools, False)
 
 
 # --- Contexto del editor ----------------------------------------------------
+
+DIAGNOSTICS_LIMIT = 20
+PERMISSION_LINE = 160  # largo de un comando que todavía se lee en un renglón
+
+
+def _read_text(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except (OSError, ValueError):
+        return None
+
 
 class _Context(object):
     """Lo que el editor sabe en el momento de la consulta."""
@@ -310,6 +463,10 @@ class _Context(object):
                 if not region.empty():
                     self.region = region
                     break
+        self.diagnostics = []
+        if view and self.path and _settings().get("context_diagnostics", True):
+            # Sólo errores y advertencias, y pocos: es contexto, no la tarea.
+            self.diagnostics = (_lsp_lines(view, self.rel, 2) or [])[:DIAGNOSTICS_LIMIT]
 
     def signature(self):
         """Cambia cuando cambia lo que describe(): evita repetirlo en cada mensaje."""
@@ -318,7 +475,7 @@ class _Context(object):
             return []
         region = [self.region.begin(), self.region.end()] if self.region else []
         changes = view.change_count() if self.dirty or not self.path else 0
-        return [self.path or view.id(), region, changes]
+        return [self.path or view.id(), region, changes, self.diagnostics]
 
     def describe(self):
         """Texto que acompaña al prompt: archivo, búfer sin guardar y selección."""
@@ -329,21 +486,36 @@ class _Context(object):
         if self.path and not self.dirty:
             parts.append("Archivo abierto en el editor: `{}`.".format(self.rel))
         elif view.size():
+            diff = None
             if self.path:
+                diff = core.buffer_diff(
+                    _read_text(self.path), view.substr(sublime.Region(0, view.size())), self.rel)
+            if diff and len(diff) <= BUFFER_LIMIT:
+                # Con el diff basta: el resto del archivo lo puede leer del disco.
+                parts.append(
+                    "Archivo abierto en el editor: `{}`. Tiene cambios sin guardar; este es el "
+                    "diff del búfer contra el archivo en disco:\n<diff>\n{}\n</diff>".format(
+                        self.rel, diff))
+            elif self.path:
                 title = "Archivo abierto en el editor: `{}`. Tiene cambios sin guardar".format(
                     self.rel)
             else:
                 title = "Búfer sin guardar{}".format(
                     " ({})".format(self.syntax) if self.syntax else "")
-            text = view.substr(sublime.Region(0, min(view.size(), BUFFER_LIMIT)))
-            note = " (recortado)" if view.size() > BUFFER_LIMIT else ""
-            parts.append("{}; este es su contenido actual{}:\n<contenido>\n{}\n</contenido>".format(
-                title, note, text))
+            if not (diff and len(diff) <= BUFFER_LIMIT):
+                text = view.substr(sublime.Region(0, min(view.size(), BUFFER_LIMIT)))
+                note = " (recortado)" if view.size() > BUFFER_LIMIT else ""
+                parts.append(
+                    "{}; este es su contenido actual{}:\n<contenido>\n{}\n</contenido>".format(
+                        title, note, text))
         if self.region is not None:
             first = view.rowcol(self.region.begin())[0] + 1
             last = view.rowcol(self.region.end())[0] + 1
             parts.append("Selección (líneas {}-{}):\n<seleccion>\n{}\n</seleccion>".format(
                 first, last, view.substr(self.region)))
+        if self.diagnostics:
+            parts.append("Avisos del linter en ese archivo:\n{}".format(
+                "\n".join(self.diagnostics)))
         return "\n\n".join(parts)
 
 
@@ -355,14 +527,14 @@ def _with_context(prompt, context):
 # --- Consultas --------------------------------------------------------------
 
 def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
-         context=None, quiet=False, on_result=None, chat_turn=False):
+         context=None, quiet=False, on_result=None, chat=None, system=None):
     """Lanza una consulta y escribe la respuesta en el chat.
 
-    chat_turn: el mensaje ya está escrito en el chat (lo envió el usuario desde ahí).
+    chat: el mensaje ya está escrito en ese chat (lo envió el usuario desde ahí).
     quiet: no toca el chat salvo que falle (se usa para generar código).
     """
-    chat = _find_chat(window) if chat_turn else None
-    if window.id() in _runners:
+    target = chat if chat is not None else (None if quiet else _find_chat(window))
+    if (quiet and _slot(window) in _runners) or (not quiet and _busy(target)):
         window.status_message("Claude sigue trabajando; usa «Claude: Detener» para cortarlo.")
         return
     settings = _settings()
@@ -375,41 +547,150 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             _end_turn(chat)
         return
 
-    extra = list(settings.get("extra_args") or [])
-    backup = None
+    user_extra = list(settings.get("extra_args") or [])
     python = core.find_python()
-    if mode == "acceptEdits" and settings.get("review_edits", True) and python:
-        # Un hook copia cada archivo antes de que Claude lo toque: de ahí salen el
-        # diff que se muestra al terminar y la posibilidad de revertir.
-        backup = os.path.join(sublime.cache_path(), "ClaudeCode", "edits",
-                              str(int(time.time() * 1000)))
-        os.makedirs(backup, exist_ok=True)
-        extra += ["--settings", core.review_settings(python, HOOK, backup)]
-    args = core.build_args(
-        claude, tools, permission_mode=mode, resume=resume,
-        model=settings.get("model"), effort=settings.get("effort"),
-        persist=not quiet, extra=extra)
+    # Un hook copia cada archivo antes de que Claude lo toque: de ahí salen el
+    # diff que se muestra al terminar y la posibilidad de revertir.
+    review = bool(mode == "acceptEdits" and settings.get("review_edits", True) and python)
+    edits_root = os.path.join(sublime.cache_path(), "ClaudeCode", "edits")
     started = time.time()
     status_view = window.active_view()
     result = {}
     turn = {"view": chat, "draft": ""}
+    run = {}  # runner, sesión viva y respaldo de este intento
+
+    def stamp():
+        return str(int(time.time() * 1000))
+
+    def shown():
+        view = turn["view"]
+        return not quiet and view is not None and view.is_valid()
+
+    def current():
+        return run.get("runner") is not None and _runners.get(run.get("key")) is run["runner"]
 
     def open_turn():
-        view = turn["view"] = _open_chat(window)
+        view = turn["view"] = target or _open_chat(window)
+        window.focus_view(view)
         turn["draft"] = _begin_turn(view)
         _block(view)
         _write(view, "## {}\n".format(title))
         if echo:
             _write(view, "> {}\n".format(echo.replace("\n", "\n> ")))
 
+    def working(text):
+        if status_view is not None and status_view.is_valid():
+            status_view.set_status(STATUS_KEY, "Claude: {}".format(text))
+
+    def say(line):
+        """Una línea suelta en medio de la respuesta, sin pisar la de actividad."""
+        if shown():
+            _clear_activity(turn["view"], turn)
+            _line(turn["view"])
+            _write(turn["view"], line)
+
+    def tick():
+        """Cuenta los segundos de la espera: distingue «sigue pensando» de «se colgó»."""
+        if not current():
+            turn["ticking"] = False
+            return
+        label = turn.get("label")
+        if label:
+            text = "{} {:.0f} s".format(label, time.time() - turn["since"])
+            working(text)
+            if shown():
+                _show_activity(turn["view"], turn, text)
+        sublime.set_timeout(tick, 1000)
+
+    def ask_permission(data):
+        """El CLI quiere usar algo que necesita permiso: decide quien está en el editor."""
+        live = run.get("live")
+        if live is None:
+            return
+        session, runner = live["session"], run.get("runner")
+        command = data["input"].get("command") if data["tool"] == "Bash" else None
+        command = str(command).strip() if command else ""
+        what = "{} {}".format(data["tool"], " ".join(command.split())) if command \
+            else data["summary"]
+        turn.update(label="esperando tu permiso…", since=time.time())
+        working(turn["label"])
+        if "\n" in command or len(what) > PERMISSION_LINE:
+            # Un guion entero en un renglón no se puede leer: va la primera línea y
+            # el comando completo queda plegado debajo, para abrirlo antes de decidir.
+            lines = command.splitlines()
+            first = "{} {}".format(data["tool"], lines[0])
+            what = first if len(first) <= PERMISSION_LINE else first[:PERMISSION_LINE - 3] + "..."
+            say("  ? pide permiso: {} … ({} línea{}, completo aquí abajo)\n".format(
+                what, len(lines), "" if len(lines) == 1 else "s"))
+            if shown():
+                view = turn["view"]
+                start = view.size() + len("```bash")
+                _write(view, "```bash\n{}\n```\n".format(command))
+                view.fold(sublime.Region(start, view.size() - len("\n```\n")))
+        else:
+            say("  ? pide permiso: {}\n".format(what))
+        if shown():
+            _show_activity(turn["view"], turn, turn["label"])
+
+        def decide(index):
+            allow = index in (0, 1)
+            if index == 1:
+                session.allowed.add(data["tool"])
+            session.answer(data["id"], allow, data["input"])
+            if run.get("runner") is not runner or not current():
+                return
+            turn.update(label="esperando la respuesta…", since=time.time())
+            if not allow:
+                say("  ✘ rechazado\n")
+
+        window.show_quick_panel([
+            ["Permitir", what],
+            ["Permitir siempre «{}» en esta conversación".format(data["tool"]),
+             "No vuelve a preguntar por esta herramienta hasta cerrar el chat"],
+            ["Rechazar", data["description"] or "Claude sigue sin hacerlo"],
+        ], decide, getattr(sublime, "KEEP_OPEN_ON_FOCUS_LOST", 0))
+
+    def show_limit(info):
+        text = core.limit_text(info)
+        if not text:
+            return
+        window.status_message("Claude: {}".format(text))
+        seen = "{}:{}".format(info.get("status"), info.get("rateLimitType"))
+        if shown() and turn["view"].settings().get(K_LIMIT) != seen:
+            # El aviso llega en cada consulta y el porcentaje va subiendo: en el chat
+            # se anota una vez por conversación; la barra de estado lleva el dato al día.
+            turn["view"].settings().set(K_LIMIT, seen)
+            say("— {}\n".format(text))
+
     def handle(kind, data):
         view = turn["view"]
         if kind == "result":
             result.update(data)
-        elif quiet or view is None or not view.is_valid():
             return
-        elif kind == "session":
-            view.settings().set(K_SESSION, data)
+        if kind == "usage":
+            turn["tokens"] = data
+            return
+        if kind == "session":
+            if run.get("live") is not None:
+                run["live"]["sid"] = data
+            if shown():
+                view.settings().set(K_SESSION, data)
+            return
+        if kind == "limit":
+            show_limit(data)
+            return
+        if kind == "permission":
+            ask_permission(data)
+            return
+        turn["label"] = data if kind == "activity" else None
+        turn["since"] = time.time()
+        if kind in ("activity", "text_start"):
+            working(data if kind == "activity" else "respondiendo…")
+        if not shown():
+            return
+        _clear_activity(view, turn)
+        if kind == "activity":
+            _show_activity(view, turn, data)
         elif kind == "text_start":
             _block(view)
         elif kind == "text":
@@ -422,9 +703,19 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             _write(view, data + "\n")
 
     def edits_summary(view):
+        backup, live = run.get("backup"), run.get("live")
+        if live is not None and live.get("backup"):
+            # El hook de un proceso vivo escribe siempre en la misma carpeta: lo de
+            # este turno se aparta para que el siguiente empiece limpio.
+            if core.edited_files(live["backup"]):
+                backup = core.rotate_backup(live["backup"], os.path.join(edits_root, stamp()))
+            else:
+                shutil.rmtree(live["backup"], ignore_errors=True)
+                os.makedirs(live["backup"], exist_ok=True)
         if not backup:
             return ""
-        diff, changed, truncated = core.edits_diff(backup, cwd)
+        report = core.edits_report(backup, cwd)
+        changed = report["changed"]
         if not changed:
             shutil.rmtree(backup, ignore_errors=True)
             return ""
@@ -433,46 +724,150 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
         if previous and previous != backup:
             shutil.rmtree(previous, ignore_errors=True)
         view.settings().set(K_BACKUP, backup)
-        return ("### Cambios en {} archivo{}\n```diff\n{}\n```\n{}"
+        return ("### Cambios en {} archivo{}\n{}+{} −{} líneas{}. {}"
                 "Para deshacerlos: «Claude: Revertir la última edición».\n").format(
-            len(changed), "" if len(changed) == 1 else "s", diff,
-            "(El diff es más largo; se muestra el comienzo.)\n" if truncated else "")
+            len(changed), "" if len(changed) == 1 else "s",
+            "```diff\n{}\n```\n".format(report["diff"]), report["added"], report["removed"],
+            " (de los archivos largos se muestra el comienzo)" if report["truncated"] else "",
+            "Cada archivo viene plegado: «Claude: Plegar o desplegar los bloques del chat» "
+            "(Ctrl+Alt+C, K) los abre. " if _settings().get("fold_edits", True) else "")
 
     def close_turn(text):
         view = turn["view"]
         if view is not None and view.is_valid():
+            _clear_activity(view, turn)
+            if "from" in turn:
+                _fold_code(view, turn["from"])
             summary = edits_summary(view)
             if summary:
                 _block(view)
+                start = view.size()
                 _write(view, summary)
+                _fold_diffs(view, start)
             _block(view)
             _write(view, text)
             _end_turn(view, turn["draft"])
             if not quiet:
                 _save_history(view)
 
+    def keep_queued():
+        """La respuesta no llegó a buen término: lo que estaba en cola vuelve al borrador."""
+        view = turn["view"]
+        waiting = _queued.pop(view.id(), []) if view is not None else []
+        turn["draft"] = "\n".join(part for part in [turn["draft"]] + waiting if part)
+
     def finish(code, stderr, stopped):
-        _runners.pop(window.id(), None)
+        run["finished"] = True
+        if current():
+            _runners.pop(run["key"], None)
         if status_view is not None and status_view.is_valid():
             status_view.erase_status(STATUS_KEY)
+        view, live = turn["view"], run.get("live")
+        if live is not None and not live["session"].alive() and view is not None \
+                and _sessions.get(view.id()) is live:
+            _sessions.pop(view.id(), None)
+            if not stopped and code != 0 and live["session"].events == 0:
+                # Ni un evento: este CLI no acepta el modo persistente. Se repite la
+                # consulta a la manera de siempre y no se vuelve a intentar.
+                shutil.rmtree(live.get("backup") or "", ignore_errors=True)
+                _live_off.append(stderr or "código {}".format(code))
+                say("— el proceso persistente no arrancó; sigo con un proceso por mensaje\n")
+                launch(False)
+                return
         if stopped:
+            keep_queued()
             close_turn("— detenido\n")
             window.status_message("Claude: detenido")
-            return
-        if code != 0 or result.get("is_error") or not result:
+        elif code != 0 or result.get("is_error") or not result:
             if quiet:
                 open_turn()
+            keep_queued()
             detail = stderr or (result.get("result") if result.get("is_error") else "") or ""
             close_turn("**Error** (código {}){}\n".format(
                 code, ": " + str(detail) if detail else ""))
+        else:
+            # El modo queda a la vista en cada turno: es el que rige el próximo mensaje.
+            parts = ["listo ({:.0f} s)".format(time.time() - started)]
+            if shown():
+                parts.append(_mode_label(view))
+            parts.append(core.context_text(turn.get("tokens"), result))
+            if settings.get("show_cost", False) and result.get("total_cost_usd") is not None:
+                parts.append("US$ {:.2f}".format(result["total_cost_usd"]))
+            close_turn("— {}\n".format(" · ".join(part for part in parts if part)))
+            window.status_message("Claude: listo")
+            if on_result:
+                on_result(result.get("result") or "")
+            if shown():
+                _send_queued(view)
+        if live is not None and not live["session"].alive() and live.get("backup"):
+            shutil.rmtree(live["backup"], ignore_errors=True)
+
+    def launch(use_live):
+        """Arranca la consulta: en el proceso vivo del chat o en uno de un solo uso."""
+        view = turn["view"]
+        result.clear()
+        run.update(live=None, backup=None, runner=None, finished=False)
+
+        def on_event(kind, data):
+            sublime.set_timeout(lambda: handle(kind, data), 0)
+
+        def on_exit(code, err, stopped):
+            sublime.set_timeout(lambda: finish(code, err, stopped), 0)
+
+        def arguments(extra, backup, live):
+            if backup:
+                os.makedirs(backup, exist_ok=True)
+                extra = extra + ["--settings", core.review_settings(python, HOOK, backup)]
+            return core.build_args(
+                claude, tools, permission_mode=mode, resume=resume,
+                model=settings.get("model"), effort=settings.get("effort"),
+                persist=not quiet, extra=extra, system=system, live=live)
+
+        try:
+            if use_live:
+                signature = [claude, cwd, tools, mode, settings.get("model"),
+                             settings.get("effort"), system, user_extra, review]
+                live = _sessions.get(view.id())
+                if live is not None and not (
+                        resume and live["key"] == signature and live.get("sid") == resume
+                        and live["session"].alive()):
+                    # Cambió el modo, el modelo o la conversación: ese proceso ya no sirve.
+                    _drop_session(view.id())
+                    live = None
+                if live is None:
+                    backup = os.path.join(
+                        edits_root, "vivo-{}-{}".format(view.id(), stamp())) if review else None
+                    session = core.Session(arguments(user_extra, backup, True), cwd)
+                    session.start()
+                    live = _sessions[view.id()] = {
+                        "session": session, "key": signature, "backup": backup, "sid": None}
+                run["live"] = live
+                runner = live["session"].ask(prompt, on_event, on_exit)
+            else:
+                run["backup"] = os.path.join(edits_root, stamp()) if review else None
+                runner = core.Runner(
+                    arguments(user_extra, run["backup"], False), cwd, prompt, on_event, on_exit)
+                runner.start()
+        except OSError as error:
+            sublime.error_message("No se pudo ejecutar Claude Code:\n\n{}".format(error))
+            keep_queued()
+            close_turn("**Error**: no se pudo ejecutar Claude Code.\n")
             return
-        close_turn("— listo ({:.0f} s)\n".format(time.time() - started))
-        window.status_message("Claude: listo")
-        if on_result:
-            on_result(result.get("result") or "")
+        if run["finished"]:
+            return
+        run["runner"] = runner
+        _runners[run["key"]] = runner
+        turn.update(label="esperando la respuesta…", since=time.time())
+        working(turn["label"])
+        if shown():
+            _show_activity(view, turn, turn["label"])
+        if not turn.get("ticking"):
+            # Al reintentar en el modo de reserva el contador ya está corriendo.
+            turn["ticking"] = True
+            sublime.set_timeout(tick, 1000)
 
     if not quiet:
-        if not chat_turn:
+        if chat is None:
             open_turn()
         state = turn["view"].settings()
         state.set(K_CWD, cwd)
@@ -480,28 +875,23 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             state.erase(K_SESSION)
         if context is not None:
             state.set(K_CONTEXT, context.signature())
+        turn["from"] = turn["view"].size()
+    run["key"] = _slot(window, None if quiet else turn["view"])
+    launch(not quiet and _live_enabled())
 
-    runner = core.Runner(
-        args, cwd, prompt,
-        on_event=lambda kind, data: sublime.set_timeout(lambda: handle(kind, data), 0),
-        on_exit=lambda code, err, stopped: sublime.set_timeout(
-            lambda: finish(code, err, stopped), 0))
-    try:
-        runner.start()
-    except OSError as error:
-        sublime.error_message("No se pudo ejecutar Claude Code:\n\n{}".format(error))
-        close_turn("**Error**: no se pudo ejecutar Claude Code.\n")
+
+def _send_queued(view):
+    """Envía el siguiente mensaje que quedó en cola mientras Claude respondía."""
+    waiting = _queued.get(view.id())
+    if not waiting or not view.is_valid() or view.settings().get(K_START) is None:
         return
-    _runners[window.id()] = runner
-    if status_view is not None:
-        status_view.set_status(STATUS_KEY, "Claude: trabajando…")
-
-
-def _chat_tools(view):
-    settings = _settings()
-    if view.settings().get(K_EDIT):
-        return settings.get("edit_tools", core.EDIT_TOOLS), "acceptEdits"
-    return settings.get("read_tools", core.READ_TOOLS), None
+    message = waiting.pop(0)
+    if not waiting:
+        _queued.pop(view.id(), None)
+    draft = view.substr(sublime.Region(view.settings().get(K_START), view.size()))
+    view.run_command("claude_chat_replace", {
+        "a": view.size(), "b": view.size(), "text": ("\n" if draft.strip() else "") + message})
+    view.run_command("claude_chat_send")
 
 
 class ClaudeChatCommand(sublime_plugin.WindowCommand):
@@ -525,7 +915,8 @@ class ClaudeChatSendCommand(sublime_plugin.TextCommand):
         if window is None:
             return
         if start is None:
-            window.status_message("Claude sigue trabajando; usa «Claude: Detener» para cortarlo.")
+            # Enter mientras responde: el mensaje queda en cola en vez de perderse.
+            ClaudeQueueMessageCommand(window).run()
             return
         message = view.substr(sublime.Region(start, view.size())).strip()
         if not message:
@@ -550,9 +941,46 @@ class ClaudeChatSendCommand(sublime_plugin.TextCommand):
             state.erase(K_NOTICE)
             if session:
                 prompt = "({})\n\n{}".format(notice, prompt)
-        tools, mode = _chat_tools(view)
+        tools, mode, note = _chat_mode(view)
         _ask(window, "", prompt, cwd, tools, mode=mode, resume=session,
-             context=context, chat_turn=True)
+             context=context, chat=view, system=note)
+
+
+class ClaudeQueueMessageCommand(sublime_plugin.WindowCommand):
+    """Deja un mensaje en cola: se envía solo cuando Claude termina de responder."""
+
+    def run(self):
+        chat = _find_chat(self.window)
+        if not _busy(chat):
+            # No hay nada que esperar: se escribe directamente en el chat.
+            self.window.run_command("claude_chat")
+            return
+        self.window.status_message(
+            "Claude sigue trabajando: lo que escribas queda en cola («Claude: Detener» lo corta).")
+        self.window.show_input_panel(
+            "Mensaje para cuando Claude termine:", "", lambda text: self.queue(chat, text),
+            None, None)
+
+    def queue(self, chat, text):
+        text = text.strip()
+        if not text or not chat.is_valid():
+            return
+        if not _busy(chat):
+            # Terminó mientras se escribía: va al chat como un mensaje normal.
+            _queued.setdefault(chat.id(), []).append(text)
+            _send_queued(chat)
+            return
+        waiting = _queued.setdefault(chat.id(), [])
+        waiting.append(text)
+        self.window.status_message("Claude: {} mensaje{} en cola".format(
+            len(waiting), "" if len(waiting) == 1 else "s"))
+
+
+class ClaudeAnotherChatCommand(sublime_plugin.WindowCommand):
+    """Abre un chat más: otra conversación, que puede correr mientras la primera responde."""
+
+    def run(self):
+        self.window.focus_view(_create_chat(self.window))
 
 
 class ClaudeChatReplaceCommand(sublime_plugin.TextCommand):
@@ -564,12 +992,14 @@ class ClaudeNewChatCommand(sublime_plugin.WindowCommand):
     """Vacía el chat y empieza una conversación nueva."""
 
     def run(self):
-        if self.window.id() in _runners:
+        view = _open_chat(self.window)
+        if _busy(view):
             self.window.status_message("Claude sigue trabajando; detenlo antes de limpiar.")
             return
-        view = _open_chat(self.window)
+        _drop_session(view.id())
+        _queued.pop(view.id(), None)
         state = view.settings()
-        for key in (K_START, K_SESSION, K_CONTEXT, K_CWD, K_NOTICE):
+        for key in (K_START, K_SESSION, K_CONTEXT, K_CWD, K_NOTICE, K_LIMIT):
             state.erase(key)
         view.set_read_only(False)
         view.run_command("claude_chat_replace", {"a": 0, "b": view.size(), "text": ""})
@@ -583,9 +1013,60 @@ class ClaudeToggleEditCommand(sublime_plugin.WindowCommand):
         view = _open_chat(self.window, focus=False)
         enabled = not view.settings().get(K_EDIT)
         _set_edit(view, enabled)
+        if view.settings().get(K_START) is not None:
+            # Con una consulta en curso no hay dónde anotarlo sin partir la respuesta.
+            _note(self.window, "— el chat ahora puede editar archivos\n" if enabled
+                  else "— el chat volvió a sólo lectura\n", view)
         self.window.status_message(
             "Claude: el chat puede editar archivos" if enabled
             else "Claude: el chat es de sólo lectura")
+
+
+class ClaudeChatModeCommand(sublime_plugin.WindowCommand):
+    """Elige entre sólo lectura, plan y edición para los próximos mensajes del chat."""
+
+    MODES = (
+        ("Sólo lectura", "Lee y responde; no modifica nada", "— el chat volvió a sólo lectura\n"),
+        ("Plan", "Investiga y propone un plan, sin tocar archivos",
+         "— el chat está en modo plan: propone y no modifica\n"),
+        ("Edición", "Modifica archivos; lo demás lo aprueba quien está en el editor",
+         "— el chat ahora puede editar archivos\n"),
+    )
+
+    def run(self):
+        view = _open_chat(self.window, focus=False)
+        state = view.settings()
+        current = 2 if state.get(K_EDIT) else 1 if state.get(K_PLAN) else 0
+        self.window.show_quick_panel(
+            [["{}{}".format("● " if index == current else "", name), detail]
+             for index, (name, detail, _) in enumerate(self.MODES)],
+            lambda index: self.choose(view, index))
+
+    def choose(self, view, index):
+        if index < 0 or not view.is_valid():
+            return
+        _set_edit(view, index == 2)
+        _set_plan(view, index == 1)
+        if view.settings().get(K_START) is not None:
+            _note(self.window, self.MODES[index][2], view)
+        self.window.status_message("Claude: chat en {}".format(_mode_label(view)))
+
+
+class ClaudeToggleDiffsCommand(sublime_plugin.WindowCommand):
+    """Despliega los diffs y el código largo del chat, o los vuelve a plegar."""
+
+    def run(self):
+        view = _find_chat(self.window)
+        regions = _diff_regions(view) + _code_regions(view) if view is not None else []
+        if not regions:
+            self.window.status_message("Claude: no hay bloques que plegar en el chat.")
+            return
+        folded = {(region.begin(), region.end()) for region in view.folded_regions()}
+        if any((region.begin(), region.end()) in folded for region in regions):
+            for region in regions:
+                view.unfold(region)
+        else:
+            view.fold(regions)
 
 
 class ClaudeReviewFileCommand(sublime_plugin.WindowCommand):
@@ -654,11 +1135,13 @@ def _saved_context(window, action):
 
 
 def _ask_edit(window, title, prompt, context, echo=None):
-    # Quien pide una edición espera poder seguir pidiéndolas desde el chat.
-    _set_edit(_open_chat(window, focus=False), True)
-    _ask(window, title, prompt, context.cwd,
-         _settings().get("edit_tools", core.EDIT_TOOLS), mode="acceptEdits",
-         echo=echo, context=context)
+    # Quien pide una edición espera poder seguir pidiéndolas desde el chat, así que
+    # se lanza igual que un mensaje suyo: el proceso sirve para lo que venga después.
+    chat = _open_chat(window, focus=False)
+    _set_edit(chat, True)
+    tools, mode, note = _chat_mode(chat)
+    _ask(window, title, prompt, context.cwd, tools, mode=mode, echo=echo, context=context,
+         system=note)
 
 
 def _background(function):
@@ -690,6 +1173,11 @@ class ClaudeEditFileCommand(sublime_plugin.WindowCommand):
 
 
 def _lsp_diagnostics(view, rel):
+    # Severidad 4 son pistas de estilo (variables sin usar atenuadas): no van.
+    return _lsp_lines(view, rel, 3)
+
+
+def _lsp_lines(view, rel, severity):
     """Avisos que LSP tiene para el archivo, o None si LSP no lo está atendiendo.
 
     Usa partes internas del paquete LSP, así que cualquier sorpresa se trata como
@@ -705,8 +1193,7 @@ def _lsp_diagnostics(view, rel):
         lines, sessions = [], 0
         for session in manager.get_sessions():
             sessions += 1
-            # Severidad 4 son pistas de estilo (variables sin usar atenuadas): no van.
-            for item in session.diagnostics.get_diagnostics_for_uri(uri, 3):
+            for item in session.diagnostics.get_diagnostics_for_uri(uri, severity):
                 start = item["range"]["start"]
                 label = " ".join(str(part) for part in (item.get("source"), item.get("code"))
                                  if part not in (None, ""))
@@ -997,19 +1484,24 @@ class ClaudeHistoryCommand(sublime_plugin.WindowCommand):
     def load(self, entries, index):
         if index < 0:
             return
-        if self.window.id() in _runners:
+        view = _open_chat(self.window)
+        if _busy(view):
             self.window.status_message("Claude sigue trabajando; detenlo antes de cambiar de chat.")
             return
         entry = entries[index]
-        view = _open_chat(self.window)
+        _drop_session(view.id())
+        _queued.pop(view.id(), None)
         state = view.settings()
-        for key in (K_START, K_CONTEXT, K_NOTICE):
+        for key in (K_START, K_CONTEXT, K_NOTICE, K_LIMIT):
             state.erase(key)
         view.set_read_only(False)
         view.run_command("claude_chat_replace", {"a": 0, "b": view.size(), "text": entry["text"]})
         state.set(K_SESSION, entry["session"])
         state.set(K_CWD, entry.get("cwd"))
         _set_edit(view, entry.get("edit"))
+        _set_plan(view, entry.get("plan") and not entry.get("edit"))
+        _fold_diffs(view)
+        _fold_code(view)
         _end_turn(view)
 
 
@@ -1044,10 +1536,23 @@ class ClaudeRevertEditCommand(sublime_plugin.WindowCommand):
         if not backup or not os.path.isdir(backup):
             self.window.status_message("Claude: no hay una edición que revertir.")
             return
-        if self.window.id() in _runners:
+        if _busy(chat):
             self.window.status_message("Claude sigue trabajando; detenlo antes de revertir.")
             return
-        changed = core.changed_since(backup)
+        files = core.edited_files(backup)
+        if len(files) < 2:
+            self.revert(chat, backup, None)
+            return
+        cwd = chat.settings().get(K_CWD) or ""
+        items = [["Todos los archivos ({})".format(len(files)), "Deshace la edición completa"]]
+        items += [[os.path.basename(path), os.path.relpath(path, cwd) if cwd else path]
+                  for path in files]
+        self.window.show_quick_panel(
+            items, lambda index: index >= 0 and self.revert(
+                chat, backup, None if index == 0 else [files[index - 1]]))
+
+    def revert(self, chat, backup, only):
+        changed = [path for path in core.changed_since(backup) if only is None or path in only]
         if changed and not sublime.ok_cancel_dialog(
                 "Estos archivos cambiaron después de la edición de Claude:\n\n{}\n\n"
                 "Si reviertes, esos cambios posteriores se pierden.".format(
@@ -1055,17 +1560,22 @@ class ClaudeRevertEditCommand(sublime_plugin.WindowCommand):
                 "Revertir igual"):
             return
         try:
-            restored = core.revert_edits(backup)
+            restored = core.revert_edits(backup, only)
         except OSError as error:
             sublime.error_message("No se pudo revertir:\n\n{}".format(error))
             return
         names = ", ".join(os.path.basename(path) for path in restored) or "nada que cambiar"
-        chat.settings().erase(K_BACKUP)
-        shutil.rmtree(backup, ignore_errors=True)
+        left = core.edited_files(backup)
+        if not left:
+            chat.settings().erase(K_BACKUP)
+            shutil.rmtree(backup, ignore_errors=True)
         # Claude no ve el disco entre mensajes: hay que contárselo en el siguiente.
-        chat.settings().set(
-            K_NOTICE, "Aviso: el usuario revirtió tu última edición ({}).".format(names))
-        _note(self.window, "— edición revertida: {}\n".format(names))
+        previous = chat.settings().get(K_NOTICE)
+        chat.settings().set(K_NOTICE, "{}Aviso: el usuario revirtió {} ({}).".format(
+            previous + " " if previous else "",
+            "parte de tu última edición" if left else "tu última edición", names))
+        _note(self.window, "— edición revertida: {}{}\n".format(
+            names, " (quedan {} sin revertir)".format(len(left)) if left else ""), chat)
 
     def is_enabled(self):
         chat = _find_chat(self.window)
@@ -1129,12 +1639,12 @@ class ClaudeReplaceRegionCommand(sublime_plugin.TextCommand):
 
 class ClaudeStopCommand(sublime_plugin.WindowCommand):
     def run(self):
-        runner = _runners.get(self.window.id())
+        runner = _current_runner(self.window)
         if runner is not None:
             runner.stop()
 
     def is_enabled(self):
-        return self.window.id() in _runners
+        return _current_runner(self.window) is not None
 
 
 def _has_terminus():
@@ -1184,7 +1694,10 @@ class ClaudeFileTracker(sublime_plugin.EventListener):
 
     def on_activated(self, view):
         window = view.window()
-        if window is None or _is_chat(view) or view.element() is not None:
+        if window is None or view.element() is not None:
+            return
+        if _is_chat(view):
+            _last_chat[window.id()] = view.id()
             return
         _last_file[window.id()] = view.id()
 
@@ -1266,27 +1779,30 @@ class ClaudeChatListener(sublime_plugin.ViewEventListener):
 
     def on_pre_close(self):
         _transcripts.pop(self.view.id(), None)
-        window = self.view.window()
-        runner = _runners.get(window.id()) if window is not None else None
+        _queued.pop(self.view.id(), None)
+        runner = _runners.get(_slot(None, self.view))
         if runner is not None:
             runner.stop()
+        _drop_session(self.view.id())
 
 
 def plugin_loaded():
     # Un chat restaurado al abrir Sublime pudo quedar a medio responder: se le
     # devuelve la marca para que se pueda seguir escribiendo.
     for window in sublime.windows():
-        view = _find_chat(window)
-        if view is None or window.id() in _runners:
-            continue
-        start = view.settings().get(K_START)
-        intact = (start is not None and start <= view.size()
-                  and view.substr(sublime.Region(start - len(MARK), start)) == MARK)
-        if not intact:
-            view.settings().erase(K_START)
-            _end_turn(view)
+        for view in _chats(window):
+            if _busy(view):
+                continue
+            start = view.settings().get(K_START)
+            intact = (start is not None and start <= view.size()
+                      and view.substr(sublime.Region(start - len(MARK), start)) == MARK)
+            if not intact:
+                view.settings().erase(K_START)
+                _end_turn(view)
 
 
 def plugin_unloaded():
     for runner in list(_runners.values()):
         runner.stop()
+    for view_id in list(_sessions):
+        _drop_session(view_id)
