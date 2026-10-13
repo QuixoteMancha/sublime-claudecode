@@ -67,7 +67,7 @@ class ParseLine(unittest.TestCase):
         self.assertEqual(core.parse_line(line(type="control_response", response={})), [])
         info = {"status": "rejected", "rateLimitType": "five_hour", "resetsAt": 1000}
         self.assertEqual(core.parse_line(line(type="rate_limit_event", rate_limit_info=info)),
-                         [("limit", info)])
+                         [("quota", info), ("limit", info)])
         self.assertEqual(core.parse_line(line(type="rate_limit_event",
                                               rate_limit_info={"status": "allowed"})), [])
         message = line(type="assistant", message={"content": [], "usage": {
@@ -151,8 +151,10 @@ class Helpers(unittest.TestCase):
         self.assertIn("No puedes ejecutar nada", read)
         self.assertNotIn("WebSearch", read)
         full = core.method_note("Read,Bash,WebSearch,WebFetch,Agent")
-        for expected in ("reproduce el fallo", "da la URL", "subagente", "`ruta:línea`"):
+        for expected in ("reproduce el fallo", "da la URL", "subagente", "`ruta:línea`",
+                         "al menos dos alternativas", "línea base"):
             self.assertIn(expected, full)
+        self.assertNotIn("línea base", read)
         watch = core.chat_note("Read,Bash", False, asks=True)
         self.assertIn("son para observar", watch)
         self.assertNotIn("son para observar", core.chat_note("Read,Edit,Bash", True, asks=True))
@@ -292,6 +294,69 @@ class Helpers(unittest.TestCase):
         with open(os.path.join(folder, "b.py")) as handle:
             self.assertEqual(handle.read(), "2\n")
         self.assertEqual(core.git_drift(folder, None), ([], []))
+
+    def test_modelo_segun_la_tarea_y_el_limite_de_uso(self):
+        used = line(type="rate_limit_event", rate_limit_info={
+            "status": "allowed", "rateLimitType": "seven_day", "utilization": 0.4})
+        self.assertEqual([kind for kind, _ in core.parse_line(used)], ["quota"])
+        quota = {}
+        core.quota_update(quota, {"status": "allowed"})
+        core.quota_update(quota, {"status": "allowed", "rateLimitType": "seven_day",
+                                  "utilization": 0.4, "resetsAt": 5000})
+        self.assertEqual(quota, {"seven_day": {"used": 40.0, "resets": 5000}})
+        self.assertEqual(core.quota_used({"utilization": 82}), 82.0)
+        self.assertEqual(core.quota_used({"status": "rejected"}), 100.0)
+
+        level = core.task_level
+        self.assertEqual(level("¿qué hace esta función?"), 0)
+        self.assertEqual(level("cambia el nombre de la variable", "acceptEdits"), 1)
+        self.assertEqual(level("x" * 300), 1)
+        self.assertEqual(level("¿por qué falla el login?"), 2)
+        self.assertEqual(level("Refactoriza el módulo de pagos", "acceptEdits"), 2)
+        self.assertEqual(level("hola", "plan"), 2)
+        self.assertEqual(level("x" * 2000), 2)
+        # Investigar afuera, o crear u optimizar algo de ML, también es exigente.
+        for text in ("busca en la web cómo hacerlo", "entrena un clasificador de spam",
+                     "mejora el recall del modelo de ML", "¿qué dice la documentación oficial?",
+                     "ajusta los hiperparámetros", "compara con el estado del arte"):
+            self.assertEqual(level(text), 2, text)
+        # «modelo» a secas suele ser el de una base de datos.
+        self.assertEqual(level("agrega un campo al modelo Aviso"), 0)
+        self.assertEqual(level("abre el html"), 0)
+
+        pick = lambda text, mode=None, quota=None, **options: core.pick_model(
+            text, mode, quota or {}, now=1000, **options)
+        self.assertEqual(pick("¿qué hace esta función?"), ("haiku", "tarea simple"))
+        self.assertEqual(pick("renombra x", "acceptEdits"), ("sonnet", "tarea corriente"))
+        self.assertEqual(pick("depura el fallo"), ("opus", "tarea exigente"))
+        self.assertEqual(pick("optimiza el entrenamiento del modelo"),
+                         ("opus", "investigación y diseño"))
+        self.assertEqual(pick("diseña la arquitectura consultando fuentes externas"),
+                         ("opus", "investigación y diseño"))
+        # La conversación no baja de modelo por una pregunta simple, pero sí sube.
+        self.assertEqual(pick("gracias", current="opus"), ("opus", "sigue la conversación"))
+        self.assertEqual(pick("depura el fallo", current="haiku"), ("opus", "tarea exigente"))
+        self.assertEqual(pick("hola", current="otro"), ("haiku", "tarea simple"))
+        # Cerca del límite se ahorra; el que ya se restableció no cuenta.
+        week = {"seven_day": {"used": 80.0, "resets": 5000}}
+        self.assertEqual(pick("depura el fallo", quota=week),
+                         ("sonnet", "límite semanal al 80 %"))
+        self.assertEqual(pick("depura el fallo", quota=week, current="opus"),
+                         ("sonnet", "límite semanal al 80 %"))
+        self.assertEqual(pick("hola", quota=week), ("haiku", "tarea simple"))
+        session = {"five_hour": {"used": 95.0, "resets": 5000}}
+        self.assertEqual(pick("depura el fallo", quota=session),
+                         ("haiku", "límite de 5 horas al 95 %"))
+        self.assertEqual(pick("depura el fallo", quota={"five_hour": {"used": 95.0, "resets": 900}}),
+                         ("opus", "tarea exigente"))
+        # El límite propio de Opus sólo saca a Opus.
+        opus = {"seven_day_opus": {"used": 99.0, "resets": None}}
+        self.assertEqual(pick("depura el fallo", quota=opus),
+                         ("sonnet", "límite semanal de Opus al 99 %"))
+        self.assertEqual(pick("depura el fallo", quota=week, limits=[85]),
+                         ("opus", "tarea exigente"))
+        self.assertEqual(pick("depura el fallo", models=["sonnet"]),
+                         ("sonnet", "tarea simple"))
 
     def test_contexto_y_limite_de_uso(self):
         result = {"modelUsage": {"a": {"contextWindow": 200000}, "b": {"contextWindow": 1000}}}

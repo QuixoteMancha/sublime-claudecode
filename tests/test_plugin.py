@@ -1619,6 +1619,160 @@ class ChatTest(unittest.TestCase):
         self.last.play()
         self.assertEqual(chat.text.count("los comandos de este turno"), before)
 
+    def auto(self, **values):
+        """Deja el modo automático limpio y con los ajustes pedidos, sólo para esta prueba."""
+        for store in (plugin._quota, plugin._account):
+            store.clear()
+            self.addCleanup(store.clear)
+        spend = plugin._spend_file()
+        self.addCleanup(lambda: os.path.exists(spend) and os.remove(spend))
+        self.enable(**dict({"model": "auto"}, **values))
+
+    def week(self, used):
+        plugin._quota["seven_day"] = {"used": used, "resets": time.time() + 3600}
+
+    def test_modelo_automatico(self):
+        self.auto(model="")
+        plugin.ClaudeChatCommand(self.window).run()
+        chat = self.chat
+        plugin.ClaudeSelectModelCommand(self.window).choose(5)
+        self.assertEqual(SETTINGS["model"], "auto")
+        self.assertIn("Modelo: automático ▾", chat.phantoms[plugin.BAR][-1][1])
+        self.say("¿qué hace esta función?")
+        self.assertEqual(self.last.option("--model"), "haiku")
+        self.last.play()
+        self.assertRegex(chat.text, r"— listo \(\d+ s\) · sólo lectura · haiku \(tarea simple\)\n")
+        # Una tarea exigente sube de modelo; después la conversación lo conserva.
+        self.say("¿por qué falla el login? @src/a.py")
+        self.assertEqual(self.last.option("--model"), "opus")
+        self.last.play([("session", "s1"),
+                        ("quota", {"status": "allowed_warning", "rateLimitType": "seven_day",
+                                   "utilization": 0.2, "resetsAt": time.time() + 3600}),
+                        ("text_start", None), ("text", "Por esto."),
+                        ("result", {"result": "x", "is_error": False})])
+        self.assertIn("· opus (tarea exigente)\n", chat.text)
+        self.assertEqual(plugin._quota["seven_day"]["used"], 20.0)
+        self.say("gracias")
+        self.assertEqual(self.last.option("--model"), "opus")
+        self.last.play()
+        self.assertIn("· opus (sigue la conversación)\n", chat.text)
+        # Los niveles se pueden cambiar, y un modelo fijo no lleva la marca de automático.
+        self.enable(auto_models=["sonnet", "sonnet", "fable"])
+        plugin.ClaudeNewChatCommand(self.window).run()
+        self.say("diseña la arquitectura")
+        self.assertEqual(self.last.option("--model"), "fable")
+        self.last.play()
+        SETTINGS["model"] = "opus"
+        self.say("sigue")
+        self.assertEqual(self.last.option("--model"), "opus")
+        self.last.play()
+        self.assertRegex(chat.text, r"— listo \(\d+ s\) · sólo lectura\n\n❯ $")
+
+    def test_consulta_antes_de_subir_el_uso_si_el_plan_pide_ahorrar(self):
+        self.auto(effort="auto")
+        self.week(80.0)
+        plugin.ClaudeChatCommand(self.window).run()
+        chat = self.chat
+        # Una tarea simple cabe en el ahorro: no hay nada que consultar.
+        self.say("hola")
+        self.assertEqual((self.last.option("--model"), self.last.option("--effort")),
+                         ("haiku", "low"))
+        self.assertEqual(self.last.prompt.split("\n")[0], "hola")
+        self.last.play()
+        self.assertIn("· haiku · esfuerzo low (tarea simple)\n", chat.text)
+
+        # La exigente pide más de lo que el plan aconseja: decide quien está en el editor.
+        calls = len(FakeRunner.calls)
+        self.say("depura el fallo del login")
+        self.assertEqual(len(FakeRunner.calls), calls)
+        items, choose = self.window.quick[-1]
+        self.assertEqual([item[0] for item in items], [
+            "Seguir ahorrando: sonnet · esfuerzo medium",
+            "Subir sólo esta vez: opus · esfuerzo high",
+            "Subir en toda esta conversación: opus · esfuerzo high"])
+        self.assertIn("límite semanal al 80 %", items[0][1])
+        choose(1)
+        self.assertEqual((self.last.option("--model"), self.last.option("--effort")),
+                         ("opus", "high"))
+        self.assertNotIn("Modo ahorro", self.last.prompt)
+        self.last.play()
+        self.assertIn("· opus · esfuerzo high (tarea exigente)\n", chat.text)
+
+        # «Sólo esta vez» era eso: la siguiente vuelve a consultar. Cerrar es ahorrar.
+        panels = len(self.window.quick)
+        self.say("depura también el registro")
+        self.assertEqual(len(self.window.quick), panels + 1)
+        self.window.quick[-1][1](-1)
+        self.assertEqual((self.last.option("--model"), self.last.option("--effort")),
+                         ("sonnet", "medium"))
+        self.assertTrue(self.last.prompt.startswith("(Modo ahorro: límite semanal al 80 %. "))
+        self.assertIn("dilo en vez de extenderte.)\n\n", self.last.prompt)
+        self.last.play()
+        self.assertIn("· sonnet · esfuerzo medium (límite semanal al 80 %)\n", chat.text)
+        # Ya respondió por esta conversación: no se le pregunta otra vez.
+        self.say("y depura el alta")
+        self.assertEqual(len(self.window.quick), panels + 1)
+        self.assertEqual(self.last.option("--model"), "sonnet")
+        self.last.play()
+
+        # En un chat nuevo se vuelve a consultar; «en toda la conversación» libera el resto.
+        plugin.ClaudeNewChatCommand(self.window).run()
+        self.say("diseña la arquitectura")
+        self.window.quick[-1][1](2)
+        self.assertEqual(self.last.option("--model"), "opus")
+        self.last.play()
+        panels = len(self.window.quick)
+        self.say("depura el resultado")
+        self.assertEqual((len(self.window.quick), self.last.option("--model")), (panels, "opus"))
+        self.last.play()
+
+        # Sin consulta: baja sola. Y un comando silencioso nunca pregunta.
+        self.enable(ask_before_raising=False)
+        plugin.ClaudeNewChatCommand(self.window).run()
+        self.say("depura el fallo")
+        self.assertEqual((len(self.window.quick), self.last.option("--model")), (panels, "sonnet"))
+        self.last.play()
+
+    def test_con_clave_de_api_cuida_el_gasto_del_dia(self):
+        self.auto(api_daily_budget=2)
+        plugin.ClaudeChatCommand(self.window).run()
+        chat = self.chat
+        self.say("renombra la variable")
+        self.last.play([("session", "s1"), ("account", {"api": True}), ("text_start", None),
+                        ("text", "Hecho."),
+                        ("result", {"result": "x", "is_error": False, "total_cost_usd": 0.5})])
+        self.assertIn("(tarea simple) · US$ 0.50 · hoy US$ 0.50 de 2.00\n", chat.text)
+        panels = len(self.window.quick)
+        self.say("depura el fallo")
+        self.assertEqual((len(self.window.quick), self.last.option("--model")), (panels, "opus"))
+        self.last.play([("session", "s1"), ("text_start", None), ("text", "Listo."),
+                        ("result", {"result": "x", "is_error": False, "total_cost_usd": 1.4})])
+        self.assertIn("· hoy US$ 1.90 de 2.00\n", chat.text)
+        # Al 95 % del presupuesto del día, lo exigente se consulta.
+        self.say("depura otro fallo")
+        items, choose = self.window.quick[-1]
+        self.assertEqual(items[0][0], "Seguir ahorrando: haiku")
+        self.assertIn("límite de gasto diario por API al 95 %", items[0][1])
+        choose(0)
+        self.assertEqual(self.last.option("--model"), "haiku")
+        self.last.play()
+        # Con suscripción no se lleva cuenta de dinero.
+        plugin._account["api"] = False
+        self.assertNotIn("api_budget", plugin._plan_quota())
+
+    def test_el_ritmo_de_uso_tambien_cuenta(self):
+        now = 1000000.0
+        week = {"seven_day": {"used": 56.0, "resets": now + 4.5 * 86400}}
+        level, why = plugin.core.quota_level(week, now=now)
+        self.assertEqual((level, why),
+                         (1, "límite semanal al 56 % con el 36 % del período transcurrido"))
+        # Si va usado más o menos lo que corresponde al tiempo transcurrido, no ahorra.
+        calm = {"seven_day": {"used": 56.0, "resets": now + 2.5 * 86400}}
+        self.assertEqual(plugin.core.quota_level(calm, now=now)[0], 2)
+        self.assertEqual(plugin.core.quota_level(week, now=now, pace=0)[0], 2)
+        self.assertEqual(plugin.core.quota_level(
+            {"seven_day": {"used": 20.0, "resets": now + 6.9 * 86400}}, now=now)[0], 2)
+
     def test_elegir_esfuerzo(self):
         self.addCleanup(SETTINGS.__setitem__, "effort", "")
         plugin.ClaudeSelectEffortCommand(self.window).run()
@@ -1724,7 +1878,7 @@ class ChatTest(unittest.TestCase):
     def test_elegir_modelo(self):
         plugin.ClaudeSelectModelCommand(self.window).run()
         items, on_select = self.window.quick[-1]
-        self.assertEqual([item[0] for item in items], ["● Predeterminado", "Fable", "Opus", "Sonnet", "Haiku"])
+        self.assertEqual([item[0] for item in items], ["● Predeterminado", "Fable", "Opus", "Sonnet", "Haiku", "Automático"])
         on_select(-1)
         self.assertEqual(SETTINGS["model"], "")
         on_select(4)

@@ -8,6 +8,36 @@
 	"model": "",
 	"effort": "",
 
+	// Con "model": "auto" o "effort": "auto" (la opción «Automático» de cada selector)
+	// el plugin elige en cada mensaje según la tarea y cuánto queda del plan. Los tres modelos son, en orden, para una tarea simple (una pregunta
+	// corta), una corriente (editar, un pedido con detalle) y una exigente (plan,
+	// diagnóstico, diseño, revisión, refactor, y todo lo que pida investigar en fuentes
+	// externas o crear u optimizar algo de aprendizaje automático).
+	"auto_models": ["haiku", "sonnet", "opus"],
+
+	// El esfuerzo de razonamiento de esos mismos tres niveles, con "effort": "auto".
+	"auto_efforts": ["low", "medium", "high"],
+
+	// Porcentajes de uso de los límites del plan (el de 5 horas o el semanal) en que el
+	// modo automático ahorra: desde el primero no pasa del modelo intermedio; desde el
+	// segundo usa el más económico. El límite propio de Opus sólo deja fuera a Opus.
+	"auto_model_limits": [75, 90],
+
+	// Ritmo: aunque no se llegue a esos porcentajes, se ahorra si de un límite va usado
+	// más que la parte del período ya transcurrida, por estos puntos de diferencia
+	// (56 % usado con el 36 % de la semana pasada: 20 puntos de más). 0 no mira el ritmo.
+	"auto_pace_margin": 20,
+
+	// Cuando la tarea pide un nivel más alto que el que el ahorro permite, pregunta
+	// antes: seguir ahorrando, subir sólo esta vez o subir en toda la conversación.
+	// Con false baja sin preguntar.
+	"ask_before_raising": true,
+
+	// Si Claude Code usa una clave de API (se paga por token): gasto máximo por día, en
+	// dólares, que el modo automático trata como un límite más. El cierre de cada
+	// turno muestra lo gastado en el turno y en el día. 0: sin tope.
+	"api_daily_budget": 0,
+
 	// Modelo al que se recurre si el elegido está saturado; vacío, ninguno.
 	"fallback_model": "",
 
@@ -34,7 +64,9 @@
 
 	// Le pide a Claude un método: investigar antes de responder, reproducir y verificar
 	// cuando puede ejecutar, citar `ruta:línea`, consultar documentación oficial en la
-	// web y dar sus fuentes. Con false sólo se le dice en qué modo está el chat.
+	// web y dar sus fuentes; y, para diseñar una arquitectura o algo de aprendizaje
+	// automático, investigar afuera, comparar alternativas y medir. Con false sólo se
+	// le dice en qué modo está el chat.
 	"work_method": true,
 
 	// Instrucciones tuyas que se suman al final (convenciones, idioma, preferencias).

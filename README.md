@@ -31,6 +31,28 @@ escribe después de la marca `❯`:
 - Un mensaje que empieza con `/` y un nombre viaja tal cual a Claude Code: sirve para sus
   comandos y skills (`/compact`, `/code-review`…). «Compactar la conversación» (`Ctrl+Alt+C`,
   `X`) resume lo conversado para liberar contexto sin empezar de cero.
+- **Modelo automático.** Con «Automático» en el desplegable de modelo, el plugin elige en cada
+  mensaje: el más económico para una pregunta corta, el intermedio para el trabajo corriente y
+  el más capaz para planes, diagnósticos, diseño, revisiones y refactors, y para lo que pida
+  investigar en fuentes externas o crear u optimizar algo de aprendizaje automático
+  (`· opus (investigación y diseño)`). Cerca de los límites
+  de uso del plan (de 5 horas o semanal) baja un escalón desde el 75 % y dos desde el 90 %.
+  Una conversación no baja de modelo porque la pregunta siguiente sea simple —cambiarlo obliga
+  a releer todo sin caché—: sólo sube si la tarea lo pide o baja si el límite obliga. El cierre
+  del turno dice cuál usó y por qué (`· sonnet (límite semanal al 80 %)`). Se ajusta con
+  `"auto_models"` y `"auto_model_limits"`.
+- **Esfuerzo automático.** La misma opción existe en el desplegable de esfuerzo: bajo, medio o
+  alto según el nivel de la tarea (`"auto_efforts"`), con el mismo ahorro.
+- **Ahorro según el plan.** Con suscripción, el modo automático mira los límites de 5 horas y
+  semanal, y también el ritmo: si va usado bastante más que la parte del período que ya pasó
+  (`"auto_pace_margin"`), ahorra desde ya para no agotarlo antes de que se restablezca. Con
+  clave de API lleva la cuenta de lo gastado en el día (`· US$ 0.12 · hoy US$ 1.40 de 5.00`) y
+  trata `"api_daily_budget"` como un límite más.
+- **Consulta antes de subir.** Si la tarea pide más de lo que ese ahorro permite, un panel
+  pregunta: seguir ahorrando (y no volver a preguntar en la conversación), subir sólo esta vez
+  o subir en toda la conversación; cerrarlo es ahorrar. Cuando se ahorra, Claude lo sabe: va a
+  lo esencial y avisa si la tarea necesita más. `"ask_before_raising": false` baja sin
+  preguntar.
 - Desde el 80 % de la ventana de contexto la barra ofrece **⚠ contexto 84 % · compactar**
   (`"context_warning"`).
 - `@ruta:10-40` adjunta sólo ese tramo del archivo. El contexto incluye también qué otros
@@ -41,7 +63,9 @@ escribe después de la marca `❯`:
 - En cualquier modo Claude puede **buscar en la web y leer páginas** (`"web_tools"`), delegar
   una búsqueda amplia en un subagente (`"agent_tools"`) y sigue un método de trabajo: investiga
   antes de responder, reproduce y verifica cuando puede ejecutar, cita `ruta:línea` y da sus
-  fuentes (`"work_method"`; `"custom_instructions"` suma las tuyas). La web no pide permiso
+  fuentes (`"work_method"`; `"custom_instructions"` suma las tuyas). Para diseñar una
+  arquitectura o algo de aprendizaje automático, o mejorar un modelo ya hecho, el método le pide
+  investigar afuera primero, comparar alternativas y fijar métrica y línea base antes de tocar. La web no pide permiso
   (`"allowed_tools"`, donde también caben reglas como `"Bash(git log *)"`).
 - Si cambias de modo a mitad de una conversación, el modo nuevo viaja con el mensaje siguiente.
 - Sin selección, el contexto incluye la línea del cursor.
@@ -98,8 +122,8 @@ Los atajos son `Ctrl+Alt+C` seguido de una letra.
 | Abrir otro chat | `y` | Una conversación más, en su propia pestaña. |
 | Elegir modo del chat… | `u` | Sólo lectura, plan o edición. |
 | Plegar o desplegar los bloques del chat | `k` | Abre los diffs y el código largo, o los vuelve a plegar. |
-| Elegir modelo… | `j` | Predeterminado, Fable, Opus, Sonnet o Haiku para las próximas consultas. |
-| Elegir esfuerzo… | `f` | Cuánto razona antes de responder, de bajo a máximo; queda anotado en el cierre de cada turno. |
+| Elegir modelo… | `j` | Predeterminado, Fable, Opus, Sonnet, Haiku o Automático para las próximas consultas. |
+| Elegir esfuerzo… | `f` | Cuánto razona antes de responder, de bajo a máximo, o automático; queda anotado en el cierre de cada turno. |
 | Revisar errores de este archivo | `r` | Revisa el archivo, o sólo la selección. |
 | Revisar cambios sin confirmar (git) | `d` | Revisa `git diff HEAD`. |
 | Explicar errores del último build | `b` | Lee la salida del último build de Sublime. |

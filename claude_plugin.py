@@ -38,6 +38,8 @@ K_LIMIT = "claude_limit"
 K_NOTE = "claude_mode_note"
 K_BACKUPS = "claude_edits"
 K_USAGE = "claude_context_used"
+K_AUTO = "claude_auto_level"
+K_RAISE = "claude_raise_usage"
 
 HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "snapshot.py")
 REMOTE_LIST = "docker ps -a --format '{{.Names}}\\t{{.Status}}'"
@@ -112,6 +114,7 @@ MODELS = (
     ("opus", "Opus", "El más capaz: revisiones y cambios delicados"),
     ("sonnet", "Sonnet", "Equilibrado: el trabajo de todos los días"),
     ("haiku", "Haiku", "El más rápido: preguntas cortas"),
+    ("auto", "Automático", "Según la tarea y cuánto queda del plan"),
 )
 EFFORTS = (
     ("", "Predeterminado", "El que tenga configurado Claude Code"),
@@ -120,6 +123,7 @@ EFFORTS = (
     ("high", "Alto", "Razona más antes de responder"),
     ("xhigh", "Muy alto", "Bugs difíciles y cambios que cruzan varios archivos"),
     ("max", "Máximo", "Lo más a fondo que puede; tarda y gasta más"),
+    ("auto", "Automático", "Según la tarea y cuánto queda del plan"),
 )
 WRITE_CODE = (
     "Escribe código para {action} en `{name}`{syntax}.\n\n"
@@ -131,6 +135,8 @@ WRITE_CODE = (
 
 _runners = {}    # «v<id del chat>» o «w<id de ventana>» (consultas sin chat) -> consulta en curso
 _sessions = {}   # id del chat -> proceso de Claude que sigue vivo entre mensajes
+_account = {}    # "api": True si el CLI usa una clave de API (se paga por token)
+_quota = {}      # tipo de límite de uso -> cuánto va usado, según el último aviso del CLI
 _tasks = {}      # id del chat -> asuntos de las tareas que Claude creó, en orden
 _queued = {}     # id del chat -> mensajes que esperan a que termine la respuesta
 _live_off = []   # por qué se dejó de usar el proceso persistente, si falló al arrancar
@@ -139,6 +145,23 @@ _last_chat = {}  # id de ventana -> id del último chat usado
 _transcripts = {}  # id del chat -> conversación hasta la marca, para protegerla
 _restoring = set()
 _testing = set()   # ids de ventana con pytest corriendo
+
+
+def _spend_file():
+    return os.path.join(sublime.packages_path(), "User", "ClaudeCode", "usage.json")
+
+
+def _plan_quota():
+    """Lo usado de cada límite: los del plan, o el gasto diario si se paga por API."""
+    quota = dict(_quota)
+    try:
+        budget = float(_settings().get("api_daily_budget") or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    if _account.get("api") and budget > 0:
+        quota["api_budget"] = {
+            "used": 100.0 * core.spend_today(_spend_file()) / budget, "resets": None}
+    return quota
 
 
 def _history_dir():
@@ -799,12 +822,15 @@ def _with_context(prompt, context):
 # --- Consultas --------------------------------------------------------------
 
 def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
-         context=None, quiet=False, on_result=None, chat=None, system=None, note=None):
+         context=None, quiet=False, on_result=None, chat=None, system=None, note=None,
+         task=None, spend=None):
     """Lanza una consulta y escribe la respuesta en el chat.
 
     chat: el mensaje ya está escrito en ese chat (lo envió el usuario desde ahí).
     quiet: no toca el chat salvo que falle (se usa para generar código).
     note: la nota de modo que lleva `system`; el chat la recuerda para avisar si cambia.
+    task: lo que pidió el usuario, sin el contexto agregado, para elegir modelo.
+    spend: lo que respondió el usuario al consultarle si subir el uso pese al ahorro.
     """
     target = chat if chat is not None else (None if quiet else _find_chat(window))
     if (quiet and _slot(window) in _runners) or (not quiet and _busy(target)):
@@ -821,6 +847,60 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
         return
 
     user_extra = list(settings.get("extra_args") or [])
+    model, effort, auto, level = settings.get("model"), settings.get("effort"), None, None
+    auto_model, auto_effort = model == "auto", effort == "auto"
+    if auto_model or auto_effort:
+        # La conversación conserva su nivel salvo que la tarea pida más o el plan menos.
+        state = chat.settings() if chat is not None and resume else None
+        sticky = state.get(K_AUTO) if state is not None else None
+        answered = state.get(K_RAISE) if state is not None else None
+        plan = core.usage_plan(
+            task or prompt, mode, _plan_quota(), sticky if isinstance(sticky, int) else None,
+            settings.get("auto_model_limits") or (75, 90),
+            free=spend is True or answered is True,
+            pace=settings.get("auto_pace_margin", 20))
+        models = [core.by_level(settings.get("auto_models"), core.AUTO_MODELS, n)
+                  for n in range(3)]
+        efforts = [core.by_level(settings.get("auto_efforts"), core.AUTO_EFFORTS, n)
+                   for n in range(3)]
+
+        def name(n):
+            return " · ".join(part for part in (
+                models[n] if auto_model else "",
+                "esfuerzo {}".format(efforts[n]) if auto_effort else "") if part)
+
+        held = plan["cap"] < plan["wanted"] and spend is not True and answered is not True
+        if held and spend is None and answered is None and not quiet \
+                and settings.get("ask_before_raising", True):
+            # La tarea pide más de lo que el ahorro permite: decide el usuario.
+            def again(choice):
+                if chat is not None and choice in (0, 2):
+                    chat.settings().set(K_RAISE, choice == 2)
+                _ask(window, title, prompt, cwd, tools, mode=mode, resume=resume, echo=echo,
+                     context=context, quiet=quiet, on_result=on_result, chat=chat,
+                     system=system, note=note, task=task, spend=choice in (1, 2))
+
+            # Cerrar el panel sin elegir es seguir ahorrando.
+            window.show_quick_panel([
+                ["Seguir ahorrando: {}".format(name(plan["cap"])),
+                 "{}; no vuelve a preguntar en esta conversación".format(plan["why"])],
+                ["Subir sólo esta vez: {}".format(name(plan["wanted"])),
+                 "Esta tarea pide más; el siguiente mensaje vuelve al ahorro"],
+                ["Subir en toda esta conversación: {}".format(name(plan["wanted"])),
+                 "Deja de ahorrar hasta el próximo chat"],
+            ], lambda index: again(max(index, 0)), getattr(sublime, "KEEP_OPEN_ON_FOCUS_LOST", 0))
+            return
+        level, auto = plan["level"], plan["reason"]
+        if auto_model:
+            model = models[level]
+        if auto_effort:
+            effort = efforts[level]
+        if held and not SLASH.match(prompt):
+            # El agente sabe que va con menos de lo que la tarea pedía, y qué hacer con eso.
+            prompt = "(Modo ahorro: {}. Ve a lo esencial, sin exploraciones amplias ni " \
+                     "subagentes que no hagan falta; si ves que la tarea necesita un modelo " \
+                     "más capaz o más razonamiento, dilo en vez de extenderte.)\n\n{}".format(
+                         plan["why"], prompt)
     # Lo que no se pregunta (la web, de fábrica); sin herramientas no hay qué permitir.
     allowed = list(settings.get("allowed_tools", ["WebSearch", "WebFetch"]) or []) \
         if tools else []
@@ -996,6 +1076,12 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             if shown():
                 view.settings().set(K_SESSION, data)
             return
+        if kind == "quota":
+            core.quota_update(_quota, data)
+            return
+        if kind == "account":
+            _account.update(data)
+            return
         if kind == "limit":
             show_limit(data)
             return
@@ -1133,10 +1219,26 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
                 else:
                     view.settings().set(K_USAGE, used)
             parts.append(core.context_text(turn.get("tokens"), result))
-            if settings.get("effort"):
-                parts.append("esfuerzo {}".format(settings.get("effort")))
-            if settings.get("show_cost", False) and result.get("total_cost_usd") is not None:
-                parts.append("US$ {:.2f}".format(result["total_cost_usd"]))
+            if auto:
+                parts.append("{} ({})".format(" · ".join(part for part in (
+                    model if auto_model else "",
+                    "esfuerzo {}".format(effort) if auto_effort else "") if part), auto))
+            if effort and not auto_effort:
+                parts.append("esfuerzo {}".format(effort))
+            cost = result.get("total_cost_usd")
+            if cost is not None and _account.get("api"):
+                # Con clave de API el costo es real: se lleva la cuenta del día. El de un
+                # proceso que sigue vivo viene acumulado, así que se anota la diferencia.
+                last = live.get("cost", 0) if live is not None else 0
+                spent = cost - last if cost >= last else cost
+                if live is not None:
+                    live["cost"] = cost
+                today = core.spend_add(_spend_file(), spent)
+                budget = settings.get("api_daily_budget") or 0
+                parts.append("US$ {:.2f} · hoy US$ {:.2f}{}".format(
+                    spent, today, " de {:.2f}".format(float(budget)) if budget else ""))
+            elif settings.get("show_cost", False) and cost is not None:
+                parts.append("US$ {:.2f}".format(cost))
             close_turn("— {}\n".format(" · ".join(part for part in parts if part)))
             window.status_message("Claude: listo")
             if on_result:
@@ -1180,14 +1282,14 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
                 extra = extra + ["--settings", core.review_settings(python, HOOK, backup)]
             return core.build_args(
                 claude, tools, permission_mode=mode, resume=resume,
-                model=settings.get("model"), effort=settings.get("effort"),
+                model=model, effort=effort,
                 persist=not quiet, extra=extra, system=system, live=live,
                 allowed=allowed, fallback=settings.get("fallback_model"))
 
         try:
             if use_live:
-                signature = [claude, cwd, tools, mode, settings.get("model"),
-                             settings.get("effort"), system, user_extra, review, allowed,
+                signature = [claude, cwd, tools, mode, model,
+                             effort, system, user_extra, review, allowed,
                              settings.get("fallback_model")]
                 live = _sessions.get(view.id())
                 if live is not None and not (
@@ -1239,6 +1341,10 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             state.set(K_NOTE, note)
         else:
             state.erase(K_NOTE)
+        if level is None:
+            state.erase(K_AUTO)
+        else:
+            state.set(K_AUTO, level)
         if context is not None:
             state.set(K_CONTEXT, context.signature())
         turn["from"] = turn["view"].size()
@@ -1322,7 +1428,7 @@ class ClaudeChatSendCommand(sublime_plugin.TextCommand):
             prompt = "(Estado actual del chat, que reemplaza lo dicho antes sobre modo y " \
                      "herramientas: {})\n\n{}".format(note, prompt)
         _ask(window, "", prompt, cwd, tools, mode=mode, resume=session,
-             context=context, chat=view, system=system, note=note)
+             context=context, chat=view, system=system, note=note, task=message)
 
 
 class ClaudeCompactCommand(sublime_plugin.WindowCommand):
@@ -1398,7 +1504,8 @@ class ClaudeNewChatCommand(sublime_plugin.WindowCommand):
         _queued.pop(view.id(), None)
         _tasks.pop(view.id(), None)
         state = view.settings()
-        for key in (K_START, K_SESSION, K_CONTEXT, K_CWD, K_NOTICE, K_LIMIT, K_NOTE, K_USAGE):
+        for key in (K_START, K_SESSION, K_CONTEXT, K_CWD, K_NOTICE, K_LIMIT, K_NOTE, K_USAGE,
+                    K_AUTO, K_RAISE):
             state.erase(key)
         view.set_read_only(False)
         view.run_command("claude_chat_replace", {"a": 0, "b": view.size(), "text": ""})
@@ -1894,7 +2001,7 @@ class ClaudeHistoryCommand(sublime_plugin.WindowCommand):
         _queued.pop(view.id(), None)
         _tasks.pop(view.id(), None)
         state = view.settings()
-        for key in (K_START, K_CONTEXT, K_NOTICE, K_LIMIT, K_USAGE):
+        for key in (K_START, K_CONTEXT, K_NOTICE, K_LIMIT, K_USAGE, K_AUTO, K_RAISE):
             state.erase(key)
         view.set_read_only(False)
         view.run_command("claude_chat_replace", {"a": 0, "b": view.size(), "text": entry["text"]})
