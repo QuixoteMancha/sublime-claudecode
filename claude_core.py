@@ -278,6 +278,8 @@ def rule_allows(rules, tool, tool_input):
 
 
 def tool_summary(name, tool_input):
+    if name == "TaskUpdate" and tool_input.get("taskId") and tool_input.get("status"):
+        return "TaskUpdate #{} {}".format(tool_input["taskId"], tool_input["status"])
     for key in ("file_path", "pattern", "command", "path", "url", "query", "subject",
                 "description"):
         value = tool_input.get(key)
@@ -638,17 +640,116 @@ class Session(object):
             turn.on_exit(0, "", turn.stopped)
 
 
-def context_text(tokens, result):
-    """Cuánto de la ventana de contexto ocupó la última llamada: «38 %» o «76k»."""
-    if not tokens:
-        return ""
+def context_percent(tokens, result):
+    """Porcentaje de la ventana de contexto que ocupó la última llamada, o None."""
     windows = [int(usage.get("contextWindow") or 0)
                for usage in ((result or {}).get("modelUsage") or {}).values()
                if isinstance(usage, dict)]
     window = max(windows) if windows else 0
-    if window:
-        return "contexto {:.0f} %".format(min(100.0, 100.0 * tokens / window))
+    if not tokens or not window:
+        return None
+    return min(100.0, 100.0 * tokens / window)
+
+
+def context_text(tokens, result):
+    """Cuánto de la ventana de contexto ocupó la última llamada: «38 %» o «76k»."""
+    if not tokens:
+        return ""
+    percent = context_percent(tokens, result)
+    if percent is not None:
+        return "contexto {:.0f} %".format(percent)
     return "contexto {:.0f}k".format(tokens / 1000.0)
+
+
+TASK_MARKS = {"pending": "☐", "in_progress": "▸", "completed": "☑", "deleted": "✗"}
+TASK_UPDATE = __import__("re").compile(r"^TaskUpdate #(\d+) (\w+)$")
+
+
+def task_line(summary, tasks):
+    """La línea de checklist de una herramienta de tareas, o None si no es una.
+
+    tasks: asuntos de las tareas creadas en la conversación, en orden; el CLI las
+    numera desde 1, así que una actualización se resuelve por posición.
+    """
+    if summary.startswith("TaskCreate "):
+        tasks.append(summary[len("TaskCreate "):])
+        return "{} {}".format(TASK_MARKS["pending"], tasks[-1])
+    match = TASK_UPDATE.match(summary)
+    if match and match.group(2) in TASK_MARKS:
+        number = int(match.group(1))
+        subject = tasks[number - 1] if 0 < number <= len(tasks) else "tarea #{}".format(number)
+        return "{} {}".format(TASK_MARKS[match.group(2)], subject)
+    return None
+
+
+def edit_preview(tool, tool_input, max_lines=80):
+    """El cambio que pide una edición, como diff, para verlo antes de dar permiso."""
+    import difflib
+    path = str(tool_input.get("file_path") or "")
+    if tool == "Edit":
+        old, new = tool_input.get("old_string"), tool_input.get("new_string")
+    elif tool == "Write":
+        current = _read(path)
+        old = current.decode("utf-8", "replace") if current is not None else ""
+        new = tool_input.get("content")
+    else:
+        return ""
+    if not path or not isinstance(old, str) or not isinstance(new, str):
+        return ""
+    name = path.lstrip(os.sep)
+    lines = list(difflib.unified_diff(
+        old.splitlines(), new.splitlines(), "a/" + name, "b/" + name, n=2, lineterm=""))
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + ["… {} líneas más".format(len(lines) - max_lines)]
+    return "\n".join(lines)
+
+
+URL = __import__("re").compile(r"https?://[^\s<>\"'`)\]]+")
+
+
+def url_at(line, offset):
+    """La URL que hay en esa posición de la línea, sin la puntuación que la sigue."""
+    for match in URL.finditer(line):
+        if match.start() <= offset <= match.end():
+            return match.group(0).rstrip(".,;:!?")
+    return None
+
+
+def _git(cwd, *args):
+    code, out, _ = _run(("git",) + args, cwd=cwd)
+    return out.strip() if code == 0 else None
+
+
+def git_checkpoint(cwd):
+    """Una foto de los archivos versionados antes de un turno que puede correr comandos.
+
+    `git stash create` arma el commit sin tocar el árbol ni la lista de stashes; con el
+    árbol limpio no devuelve nada y la foto es HEAD. None si no hay repositorio.
+    """
+    try:
+        if _git(cwd, "rev-parse", "--is-inside-work-tree") != "true":
+            return None
+        ref = _git(cwd, "stash", "create") or _git(cwd, "rev-parse", "HEAD")
+        untracked = _git(cwd, "ls-files", "--others", "--exclude-standard")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if not ref:
+        return None
+    return {"ref": ref, "untracked": set((untracked or "").splitlines())}
+
+
+def git_drift(cwd, checkpoint, ignore=()):
+    """Qué cambió desde la foto, sin contar `ignore`: (versionados, creados)."""
+    after = git_checkpoint(cwd)
+    if not checkpoint or not after:
+        return [], []
+    skip = {os.path.relpath(path, cwd) for path in ignore}
+    changed = []
+    if after["ref"] != checkpoint["ref"]:
+        names = _git(cwd, "diff", "--name-only", "--relative", checkpoint["ref"], after["ref"])
+        changed = [name for name in (names or "").splitlines() if name not in skip]
+    created = sorted(after["untracked"] - checkpoint["untracked"] - skip)
+    return changed, created
 
 
 LIMIT_NAMES = {

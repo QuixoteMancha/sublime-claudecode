@@ -1522,6 +1522,103 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(self.window.commands[-1][1]["cmd"], ["/bin/claude"])
         self.assertEqual(launched, [])
 
+    def test_el_permiso_de_una_edicion_muestra_el_cambio(self):
+        self.live()
+        plugin.ClaudeChatCommand(self.window).run()
+        self.toggle_edit()
+        self.say("ajusta la configuración")
+        chat = self.chat
+        self.last.on_event("permission", {
+            "id": "r1", "tool": "Edit", "summary": "Edit /etc/x.conf", "description": "",
+            "blocked_path": "/etc/x.conf",
+            "input": {"file_path": "/etc/x.conf", "old_string": "a\nb", "new_string": "a\nc"}})
+        self.assertIn("  ? pide permiso: Edit /etc/x.conf\n```diff\n--- a/etc/x.conf\n"
+                      "+++ b/etc/x.conf\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n```\n", chat.text)
+        # Un cambio corto se ve entero; uno largo llega plegado, con su control.
+        self.assertEqual(chat.folds, [])
+        self.assertIn("▾ plegar", chat.phantoms[plugin.FOLDS][-1][1])
+        self.window.quick[-1][1](0)
+        self.last.on_event("permission", {
+            "id": "r2", "tool": "Write", "summary": "Write /etc/y.conf", "description": "",
+            "blocked_path": "", "input": {"file_path": "/no/existe/y.conf",
+                                          "content": "linea\n" * 30}})
+        self.assertEqual(len(chat.folds), 1)
+        self.assertIn("▸ mostrar 31 líneas", chat.phantoms[plugin.FOLDS][-1][1])
+
+    def test_doble_clic_en_una_url_abre_el_navegador(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        chat = self.chat
+        chat.text = "Fuente: https://docs.python.org/3/library/os.html.\n\n❯ "
+        chat._sel[:] = [Region(chat.text.index("python"))]
+        plugin.ClaudeChatListener(chat).on_post_text_command("drag_select", {"by": "words"})
+        self.assertEqual(self.window.commands[-1], (
+            "open_url", {"url": "https://docs.python.org/3/library/os.html"}))
+        self.assertEqual(self.window.opened, [])
+
+    def test_tareas_como_checklist_y_aviso_de_contexto(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        chat = self.chat
+        self.say("hazlo por pasos")
+        self.last.play([
+            ("session", "s1"), ("tool", "TaskCreate Leer el módulo"),
+            ("tool", "TaskCreate Corregir"), ("tool", "TaskUpdate #1 completed"),
+            ("tool", "TaskList"), ("usage", 170000), ("text_start", None), ("text", "Sigo."),
+            ("result", {"result": "x", "is_error": False,
+                        "modelUsage": {"m": {"contextWindow": 200000}}})])
+        self.assertIn("  ☐ Leer el módulo\n  ☐ Corregir\n  ☑ Leer el módulo\n  ⚙ TaskList\n",
+                      chat.text)
+        _, bar, click = chat.phantoms[plugin.BAR][-1]
+        self.assertIn('href="compact">⚠ contexto 85 % · compactar', bar)
+        click("compact")
+        self.assertEqual(self.last.prompt, "/compact")
+        self.last.play([("session", "s1"), ("usage", 20000),
+                        ("result", {"result": "", "is_error": False,
+                                    "modelUsage": {"m": {"contextWindow": 200000}}})])
+        self.assertNotIn("compactar", chat.phantoms[plugin.BAR][-1][1])
+        # En un chat nuevo las tareas se numeran otra vez desde la primera.
+        plugin.ClaudeNewChatCommand(self.window).run()
+        self.say("otra cosa")
+        self.last.play([("session", "s2"), ("tool", "TaskUpdate #1 completed"),
+                        ("result", {"result": "x", "is_error": False})])
+        self.assertIn("  ☑ tarea #1\n", chat.text)
+
+    @unittest.skipUnless(__import__("shutil").which("git"), "sin git")
+    def test_avisa_lo_que_cambiaron_los_comandos_y_como_volver(self):
+        import subprocess
+        folder, path = self.project()
+
+        def git(*args):
+            subprocess.run(("git",) + args, cwd=folder, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        git("init", "-q")
+        git("config", "user.name", "x")
+        git("config", "user.email", "x@x")
+        git("add", ".")
+        git("commit", "-qm", "inicio")
+        self.live()
+        plugin.ClaudeChatCommand(self.window).run()
+        self.toggle_edit()
+        self.say("formatea el proyecto")
+        chat = self.chat
+        with open(path, "w") as handle:
+            handle.write("def f():\n    return 1 / 0\n")
+        with open(os.path.join(folder, "salida.log"), "w") as handle:
+            handle.write("ok\n")
+        self.last.play([("session", "s1"), ("tool", "Bash black ."), ("text_start", None),
+                        ("text", "Hecho."), ("result", {"result": "x", "is_error": False})])
+        self.assertRegex(
+            chat.text,
+            r"— los comandos de este turno modificaron calc\.py y crearon salida\.log; eso no "
+            r"lo deshace «Revertir»\. Para devolver .*: `git checkout [0-9a-f]{10} -- \.`\n\n❯ $")
+        # Un turno sin comandos no avisa aunque el disco cambie por otro lado.
+        before = chat.text.count("los comandos de este turno")
+        self.say("gracias")
+        with open(path, "w") as handle:
+            handle.write("def f():\n    return 3\n")
+        self.last.play()
+        self.assertEqual(chat.text.count("los comandos de este turno"), before)
+
     def test_elegir_esfuerzo(self):
         self.addCleanup(SETTINGS.__setitem__, "effort", "")
         plugin.ClaudeSelectEffortCommand(self.window).run()

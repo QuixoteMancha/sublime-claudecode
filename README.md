@@ -13,7 +13,9 @@ escribe después de la marca `❯`:
   la quita.
 - El archivo en que estabas trabajando (y su selección) viaja como contexto cuando cambia.
 - Todos los comandos responden en el chat, así que se les puede contestar ahí.
-- Doble clic sobre una cita `ruta:línea` abre el archivo.
+- Doble clic sobre una cita `ruta:línea` abre el archivo; sobre una URL, el navegador.
+- Las tareas que Claude se anota en un trabajo largo se ven como lista: `☐` pendiente, `▸` en
+  curso, `☑` hecha.
 - `@` abre la lista de archivos del proyecto y deja escrito `@ruta`; Claude lee los adjuntos
   antes de responder (`Esc` deja la arroba sola).
 - Cada conversación se guarda al terminar un turno; «Conversaciones anteriores…» la devuelve al
@@ -29,6 +31,8 @@ escribe después de la marca `❯`:
 - Un mensaje que empieza con `/` y un nombre viaja tal cual a Claude Code: sirve para sus
   comandos y skills (`/compact`, `/code-review`…). «Compactar la conversación» (`Ctrl+Alt+C`,
   `X`) resume lo conversado para liberar contexto sin empezar de cero.
+- Desde el 80 % de la ventana de contexto la barra ofrece **⚠ contexto 84 % · compactar**
+  (`"context_warning"`).
 - `@ruta:10-40` adjunta sólo ese tramo del archivo. El contexto incluye también qué otros
   archivos del proyecto están abiertos.
   `"chat_edit_default": true` hace que nazca pudiendo editar. Cada turno termina indicando el
@@ -74,8 +78,11 @@ correr un comando —o leer o editar fuera de la carpeta de trabajo— aparece u
 siempre» vale para ese programa (`pytest`, `git log`) o ese sitio web, no para la herramienta
 entera, y no se ofrece para comandos compuestos ni intérpretes (`python -c`, `bash`, `sudo`). El comando completo queda
 escrito en el chat (`? pide permiso: Bash pytest -q`). Lo que ya permitan tus ajustes de Claude
-Code no se pregunta. Lo que haga un comando no entra en el diff ni se puede revertir desde el
-plugin. `"ask_tools": ""` y `"read_ask_tools": ""` dejan el chat sin ejecutar comandos.
+Code no se pregunta. Cuando el permiso es para editar o escribir un archivo, el cambio queda a la vista
+en el chat como diff antes de decidir. Lo que haga un comando no entra en el diff ni se puede
+revertir desde el plugin; en un repositorio git, el chat toma antes una foto de los archivos
+versionados (`"git_checkpoint"`) y, si los comandos cambiaron algo, lo avisa junto con el
+`git checkout` que lo devuelve. `"ask_tools": ""` y `"read_ask_tools": ""` dejan el chat sin ejecutar comandos.
 
 ## Comandos
 

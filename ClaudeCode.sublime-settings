@@ -62,6 +62,16 @@
 	// al terminar y poder revertir. Necesita python3 en el sistema.
 	"review_edits": true,
 
+	// En un repositorio git, antes de un turno que puede correr comandos se toma una
+	// foto de los archivos versionados (`git stash create`: no toca el árbol ni la
+	// lista de stashes). Si los comandos cambiaron algo, el chat lo avisa y da el
+	// `git checkout` que lo devuelve.
+	"git_checkpoint": true,
+
+	// Desde este porcentaje de la ventana de contexto, la barra ofrece compactar.
+	// 0 no avisa.
+	"context_warning": 80,
+
 	// Si el chat nace pudiendo editar archivos. Con false nace de sólo lectura y se
 	// habilita con el desplegable de modo o «Elegir modo del chat…» (Ctrl+Alt+C, U).
 	"chat_edit_default": false,

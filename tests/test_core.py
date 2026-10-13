@@ -215,6 +215,84 @@ class Helpers(unittest.TestCase):
             core.mentioned_files("mira @a.py:10-40, @a.py:7 y @b.py:3 y @a.py.", folder),
             ["a.py:10-40", "a.py:7", "a.py"])
 
+    def test_tareas_vista_previa_y_enlaces(self):
+        result = {"modelUsage": {"m": {"contextWindow": 200000}}}
+        self.assertEqual(core.context_percent(170000, result), 85.0)
+        self.assertIsNone(core.context_percent(170000, {}))
+        self.assertIsNone(core.context_percent(0, result))
+
+        self.assertEqual(core.tool_summary("TaskUpdate", {"taskId": "2", "status": "completed"}),
+                         "TaskUpdate #2 completed")
+        tasks = []
+        self.assertEqual(core.task_line("TaskCreate Leer el módulo", tasks), "☐ Leer el módulo")
+        self.assertEqual(core.task_line("TaskCreate Corregir", tasks), "☐ Corregir")
+        self.assertEqual(core.task_line("TaskUpdate #2 in_progress", tasks), "▸ Corregir")
+        self.assertEqual(core.task_line("TaskUpdate #1 completed", tasks), "☑ Leer el módulo")
+        self.assertEqual(core.task_line("TaskUpdate #7 completed", tasks), "☑ tarea #7")
+        self.assertIsNone(core.task_line("TaskUpdate #1 rara", tasks))
+        self.assertIsNone(core.task_line("Bash ls", tasks))
+
+        self.assertEqual(
+            core.edit_preview("Edit", {"file_path": "/etc/x.conf", "old_string": "a\nb",
+                                       "new_string": "a\nc"}),
+            "--- a/etc/x.conf\n+++ b/etc/x.conf\n@@ -1,2 +1,2 @@\n a\n-b\n+c")
+        folder = tempfile.mkdtemp(prefix="claude-st-")
+        self.addCleanup(__import__("shutil").rmtree, folder, True)
+        path = os.path.join(folder, "a.txt")
+        with open(path, "w") as handle:
+            handle.write("uno\n")
+        written = core.edit_preview("Write", {"file_path": path, "content": "uno\ndos\n"})
+        self.assertTrue(written.endswith("@@ -1 +1,2 @@\n uno\n+dos"))
+        new = core.edit_preview("Write", {"file_path": path + ".nuevo", "content": "x\n" * 200},
+                                max_lines=10)
+        self.assertTrue(new.endswith("… 193 líneas más"))
+        self.assertEqual(core.edit_preview("Bash", {"command": "ls"}), "")
+        self.assertEqual(core.edit_preview("Edit", {"file_path": "/x"}), "")
+
+        line_ = "Según https://docs.python.org/3/library/os.html, y (https://a.b/c)."
+        self.assertEqual(core.url_at(line_, 10), "https://docs.python.org/3/library/os.html")
+        self.assertEqual(core.url_at(line_, line_.index("a.b")), "https://a.b/c")
+        self.assertIsNone(core.url_at(line_, 2))
+
+    @unittest.skipUnless(__import__("shutil").which("git"), "sin git")
+    def test_foto_de_git_y_lo_que_cambio_despues(self):
+        folder = tempfile.mkdtemp(prefix="claude-st-")
+        self.addCleanup(__import__("shutil").rmtree, folder, True)
+        self.assertIsNone(core.git_checkpoint(os.path.join(folder, "no-existe")))
+
+        def git(*args):
+            subprocess.run(("git", "-c", "user.name=x", "-c", "user.email=x@x") + args,
+                           cwd=folder, check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+
+        def write(name, text):
+            with open(os.path.join(folder, name), "w") as handle:
+                handle.write(text)
+
+        git("init", "-q")
+        git("config", "user.name", "x")
+        git("config", "user.email", "x@x")
+        write("a.py", "1\n")
+        write("b.py", "1\n")
+        git("add", ".")
+        git("commit", "-qm", "inicio")
+        clean = core.git_checkpoint(folder)
+        self.assertEqual(core.git_drift(folder, clean), ([], []))
+        write("a.py", "2\n")
+        write("b.py", "2\n")
+        write("nuevo.txt", "n\n")
+        self.assertEqual(core.git_drift(folder, clean, [os.path.join(folder, "b.py")]),
+                         (["a.py"], ["nuevo.txt"]))
+        # Con cambios sin confirmar, la foto es la de ese momento y no HEAD.
+        dirty = core.git_checkpoint(folder)
+        self.assertNotEqual(dirty["ref"], clean["ref"])
+        write("b.py", "3\n")
+        self.assertEqual(core.git_drift(folder, dirty), (["b.py"], []))
+        git("checkout", dirty["ref"], "--", ".")
+        with open(os.path.join(folder, "b.py")) as handle:
+            self.assertEqual(handle.read(), "2\n")
+        self.assertEqual(core.git_drift(folder, None), ([], []))
+
     def test_contexto_y_limite_de_uso(self):
         result = {"modelUsage": {"a": {"contextWindow": 200000}, "b": {"contextWindow": 1000}}}
         self.assertEqual(core.context_text(76000, result), "contexto 38 %")

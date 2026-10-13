@@ -37,6 +37,7 @@ K_NUMBER = "claude_number"
 K_LIMIT = "claude_limit"
 K_NOTE = "claude_mode_note"
 K_BACKUPS = "claude_edits"
+K_USAGE = "claude_context_used"
 
 HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "snapshot.py")
 REMOTE_LIST = "docker ps -a --format '{{.Names}}\\t{{.Status}}'"
@@ -130,6 +131,7 @@ WRITE_CODE = (
 
 _runners = {}    # «v<id del chat>» o «w<id de ventana>» (consultas sin chat) -> consulta en curso
 _sessions = {}   # id del chat -> proceso de Claude que sigue vivo entre mensajes
+_tasks = {}      # id del chat -> asuntos de las tareas que Claude creó, en orden
 _queued = {}     # id del chat -> mensajes que esperan a que termine la respuesta
 _live_off = []   # por qué se dejó de usar el proceso persistente, si falló al arrancar
 _last_file = {}  # id de ventana -> id de la última pestaña que no es el chat
@@ -509,11 +511,25 @@ def _show_bar(view):
     if state.get(K_PLAN) and state.get(K_SESSION):
         # Hay un plan sobre la mesa: un clic pasa a edición y pide aplicarlo.
         chips += '&nbsp;&nbsp;<a class="chip" href="apply">▶ Aplicar el plan</a>'
+    used, limit = state.get(K_USAGE), _settings().get("context_warning", 80)
+    if used and limit and used >= limit and state.get(K_SESSION):
+        chips += '&nbsp;&nbsp;<a class="chip" href="compact">⚠ contexto {:.0f} % · ' \
+                 'compactar</a>'.format(used)
     view.add_phantom(
         BAR, sublime.Region(point, point),
         '<body id="claude-bar">{}<div class="bar">{}</div></body>'.format(BAR_STYLE, chips),
         getattr(sublime, "LAYOUT_BLOCK", 2),
-        lambda key: _apply_plan(view) if key == "apply" else _dropdown(view, key))
+        lambda key: _bar_click(view, key))
+
+
+def _bar_click(view, key):
+    if key == "apply":
+        _apply_plan(view)
+    elif key == "compact":
+        if view.window() is not None:
+            ClaudeCompactCommand(view.window()).run()
+    else:
+        _dropdown(view, key)
 
 
 def _send_text(view, text):
@@ -669,6 +685,8 @@ def _chat_mode(view):
 # --- Contexto del editor ----------------------------------------------------
 
 DIAGNOSTICS_LIMIT = 20
+PREVIEW_OPEN = 12      # hasta estas líneas, el cambio de un permiso se muestra desplegado
+DRIFT_NAMES = 8
 PERMISSION_LINE = 160  # largo de un comando que todavía se lee en un renglón
 
 
@@ -918,6 +936,15 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
                 _fold_controls(view)
         else:
             say("  ? pide permiso: {}\n".format(what))
+            preview = core.edit_preview(data["tool"], data["input"])
+            if preview and shown():
+                # El cambio a la vista antes de decidir; uno largo llega plegado.
+                view = turn["view"]
+                start = view.size()
+                _write(view, "```diff\n{}\n```\n".format(preview))
+                if preview.count("\n") > PREVIEW_OPEN:
+                    view.fold(_diff_regions(view, start))
+                _fold_controls(view)
         if shown():
             _show_activity(turn["view"], turn, turn["label"])
 
@@ -983,6 +1010,8 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
         if kind == "permission":
             ask_permission(data)
             return
+        if kind == "tool" and data.split(" ", 1)[0] == "Bash":
+            turn["ran"] = True
         turn["label"] = data if kind == "activity" else None
         turn["since"] = time.time()
         if kind in ("activity", "text_start"):
@@ -998,7 +1027,8 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             _write(view, data)
         elif kind == "tool":
             _line(view)
-            _write(view, "  ⚙ {}\n".format(data))
+            task = core.task_line(data, _tasks.setdefault(view.id(), []))
+            _write(view, "  {}\n".format(task) if task else "  ⚙ {}\n".format(data))
         elif kind == "raw":
             _line(view)
             _write(view, data + "\n")
@@ -1023,7 +1053,7 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
         core.mark_applied(backup)
         # Cada turno que edita deja su respaldo: revertir va deshaciendo de a uno.
         _set_backups(view, [path for path in _backups(view) if path != backup] + [backup])
-        turn["changed"] = changed
+        turn["changed"] = turn["edited"] = changed
         return ("### Cambios en {} archivo{}\n{}+{} −{} líneas{}. {}"
                 "Para deshacerlos: «Claude: Revertir la última edición».\n").format(
             len(changed), "" if len(changed) == 1 else "s",
@@ -1097,6 +1127,11 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             parts = ["listo ({} s)".format(int(time.time() - started))]
             if shown():
                 parts.append(_mode_label(view))
+                used = core.context_percent(turn.get("tokens"), result)
+                if used is None:
+                    view.settings().erase(K_USAGE)
+                else:
+                    view.settings().set(K_USAGE, used)
             parts.append(core.context_text(turn.get("tokens"), result))
             if settings.get("effort"):
                 parts.append("esfuerzo {}".format(settings.get("effort")))
@@ -1110,12 +1145,28 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
                 _send_queued(view)
         if live is not None and not live["session"].alive() and live.get("backup"):
             shutil.rmtree(live["backup"], ignore_errors=True)
+        checkpoint = turn.get("git")
+        if checkpoint and turn.get("ran") and view is not None:
+            edited = list(turn.get("edited") or [])
+
+            def look():
+                changed, created = core.git_drift(cwd, checkpoint, edited)
+                if changed or created:
+                    sublime.set_timeout(lambda: _report_drift(
+                        window, view, checkpoint["ref"], changed, created), 0)
+
+            _background(look)
 
     def launch(use_live):
         """Arranca la consulta: en el proceso vivo del chat o en uno de un solo uso."""
         view = turn["view"]
         result.clear()
         run.update(live=None, backup=None, runner=None, finished=False)
+        if mode == "acceptEdits" and "git" not in turn and "Bash" in tools.split(",") \
+                and settings.get("git_checkpoint", True):
+            # Lo que haga un comando no pasa por el hook: una foto de git deja volver atrás.
+            turn["git"] = None
+            _background(lambda: turn.update(git=core.git_checkpoint(cwd)))
 
         def on_event(kind, data):
             sublime.set_timeout(lambda: handle(kind, data), 0)
@@ -1203,6 +1254,7 @@ def _send_queued(view):
     message = waiting.pop(0)
     if not waiting:
         _queued.pop(view.id(), None)
+        _tasks.pop(view.id(), None)
     draft = view.substr(sublime.Region(view.settings().get(K_START), view.size()))
     view.run_command("claude_chat_replace", {
         "a": view.size(), "b": view.size(), "text": ("\n" if draft.strip() else "") + message})
@@ -1344,8 +1396,9 @@ class ClaudeNewChatCommand(sublime_plugin.WindowCommand):
             return
         _drop_session(view.id())
         _queued.pop(view.id(), None)
+        _tasks.pop(view.id(), None)
         state = view.settings()
-        for key in (K_START, K_SESSION, K_CONTEXT, K_CWD, K_NOTICE, K_LIMIT, K_NOTE):
+        for key in (K_START, K_SESSION, K_CONTEXT, K_CWD, K_NOTICE, K_LIMIT, K_NOTE, K_USAGE):
             state.erase(key)
         view.set_read_only(False)
         view.run_command("claude_chat_replace", {"a": 0, "b": view.size(), "text": ""})
@@ -1539,6 +1592,29 @@ def _lsp_lines(view, rel, severity):
         return lines if sessions else None
     except Exception:
         return None
+
+
+def _report_drift(window, chat, ref, changed, created):
+    """Avisa de lo que cambiaron los comandos de un turno y cómo volver atrás."""
+    if not chat.is_valid() or chat.settings().get(K_START) is None:
+        return
+
+    def names(paths):
+        extra = len(paths) - DRIFT_NAMES
+        return ", ".join(paths[:DRIFT_NAMES]) + (" y {} más".format(extra) if extra > 0 else "")
+
+    parts = []
+    if changed:
+        parts.append("modificaron {}".format(names(changed)))
+    if created:
+        parts.append("crearon {}".format(names(created)))
+    text = "— los comandos de este turno {}; eso no lo deshace «Revertir».".format(
+        " y ".join(parts))
+    if changed:
+        text += " Para devolver los archivos versionados a como estaban antes del turno " \
+                "(se pierde todo lo hecho en ellos desde entonces): " \
+                "`git checkout {} -- .`".format(ref[:10])
+    _note(window, text + "\n", chat)
 
 
 def _check_edits(window, chat, files, cwd):
@@ -1816,8 +1892,9 @@ class ClaudeHistoryCommand(sublime_plugin.WindowCommand):
         entry = entries[index]
         _drop_session(view.id())
         _queued.pop(view.id(), None)
+        _tasks.pop(view.id(), None)
         state = view.settings()
-        for key in (K_START, K_CONTEXT, K_NOTICE, K_LIMIT):
+        for key in (K_START, K_CONTEXT, K_NOTICE, K_LIMIT, K_USAGE):
             state.erase(key)
         view.set_read_only(False)
         view.run_command("claude_chat_replace", {"a": 0, "b": view.size(), "text": entry["text"]})
@@ -2109,7 +2186,7 @@ class ClaudeChatListener(sublime_plugin.ViewEventListener):
         return None
 
     def on_post_text_command(self, name, args):
-        """Doble clic sobre una cita `ruta:línea` abre el archivo."""
+        """Doble clic sobre una cita `ruta:línea` abre el archivo; sobre una URL, el navegador."""
         if name != "drag_select" or (args or {}).get("by") != "words":
             return
         view, window = self.view, self.view.window()
@@ -2118,6 +2195,10 @@ class ClaudeChatListener(sublime_plugin.ViewEventListener):
         point = view.sel()[0].begin()
         line = view.line(point)
         offset = point - line.begin()
+        url = core.url_at(view.substr(line), offset)
+        if url:
+            window.run_command("open_url", {"url": url})
+            return
         for match in REFERENCE.finditer(view.substr(line)):
             if match.start() <= offset <= match.end():
                 path = os.path.join(view.settings().get(K_CWD) or "", match.group(1))
@@ -2131,6 +2212,7 @@ class ClaudeChatListener(sublime_plugin.ViewEventListener):
     def on_pre_close(self):
         _transcripts.pop(self.view.id(), None)
         _queued.pop(self.view.id(), None)
+        _tasks.pop(self.view.id(), None)
         runner = _runners.get(_slot(None, self.view))
         if runner is not None:
             runner.stop()
