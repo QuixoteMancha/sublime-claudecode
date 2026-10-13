@@ -98,7 +98,9 @@ Ese proceso puede preguntar antes de actuar. En modo edición el chat suma las h
 `"ask_tools"` y en sólo lectura y plan las de `"read_ask_tools"` (de fábrica, `Bash` en ambos:
 en lectura sirve para correr pruebas, mirar git o reproducir un error). Cuando Claude quiere
 correr un comando —o leer o editar fuera de la carpeta de trabajo— aparece un panel con
-**Permitir**, **Permitir siempre** o **Rechazar**; cerrarlo sin elegir es rechazar. «Permitir
+**Permitir**, **Permitir siempre** o **Rechazar**; cerrarlo sin elegir es rechazar. Las mismas
+tres opciones quedan como botones en el chat, bajo la solicitud, por si el panel se pierde; y
+si llegan varias solicitudes a la vez, los paneles se muestran de a uno. «Permitir
 siempre» vale para ese programa (`pytest`, `git log`) o ese sitio web, no para la herramienta
 entera, y no se ofrece para comandos compuestos ni intérpretes (`python -c`, `bash`, `sudo`). El comando completo queda
 escrito en el chat (`? pide permiso: Bash pytest -q`). Lo que ya permitan tus ajustes de Claude

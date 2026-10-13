@@ -315,6 +315,7 @@ class ChatTest(unittest.TestCase):
         plugin._runners.clear()
         plugin._sessions.clear()
         plugin._queued.clear()
+        plugin._panels.clear()
         del plugin._live_off[:]
         plugin._last_file.clear()
         plugin._last_chat.clear()
@@ -1894,6 +1895,55 @@ class ChatTest(unittest.TestCase):
         self.last.play()
         self.say("otro cambio")
         self.assertEqual(self.last.prompt, "otro cambio")
+
+    def test_el_permiso_tambien_se_responde_desde_el_chat(self):
+        self.live()
+        plugin.ClaudeChatCommand(self.window).run()
+        self.toggle_edit()
+        self.say("corre dos cosas")
+        chat, session = self.chat, FakeSession.made[0]
+        del timers[:]
+
+        def ask(request_id, command):
+            self.last.on_event("permission", {
+                "id": request_id, "tool": "Bash", "input": {"command": command},
+                "summary": "Bash " + command, "description": "", "blocked_path": ""})
+            return chat.phantoms["{}:{}".format(plugin.PERMIT, request_id)][-1]
+
+        panels = len(self.window.quick)
+        _, buttons, click = ask("r1", "pytest -q")
+        for expected in ('href="allow">Permitir<', 'href="always">Permitir siempre «Bash pytest …»',
+                         'href="deny">Rechazar<'):
+            self.assertIn(expected, buttons)
+        self.assertTrue(chat.text.endswith(
+            "  ? pide permiso: Bash pytest -q\n  ⋯ esperando tu permiso…\n"))
+        # Un segundo permiso no abre su panel encima del primero: espera su turno.
+        _, _, click_two = ask("r2", "ls")
+        self.assertEqual(len(self.window.quick), panels + 1)
+
+        # El panel se perdió sin responder: los botones del chat siguen ahí.
+        click("allow")
+        self.assertEqual(session.answers, [("r1", True, {"command": "pytest -q"})])
+        self.assertNotIn("claude_permit:r1", chat.phantoms)
+        self.assertEqual(self.window.commands[-1][0], "hide_overlay")
+        self.assertIn("esperando tu permiso…", chat.text)
+        click("deny")  # un segundo clic sobre el mismo ya no cuenta
+        self.assertEqual(len(session.answers), 1)
+        timers.pop()()
+        items, decide = self.window.quick[-1]
+        self.assertEqual((len(self.window.quick), items[0]), (panels + 2, ["Permitir", "Bash ls"]))
+        decide(-1)
+        self.assertEqual(session.answers[-1][:2], ("r2", False))
+        self.assertIn("  ✘ rechazado\n", chat.text)
+        self.assertNotIn("claude_permit:r2", chat.phantoms)
+        click_two("allow")
+        self.assertEqual(len(session.answers), 2)
+
+        # Si el turno termina con un permiso pendiente, no quedan botones ni cola trabada.
+        ask("r3", "make")
+        self.last.stop()
+        self.assertNotIn("claude_permit:r3", chat.phantoms)
+        self.assertEqual(plugin._panels[self.window.id()], [])
 
     def test_permitir_siempre_no_se_ofrece_para_un_comando_compuesto(self):
         self.live()

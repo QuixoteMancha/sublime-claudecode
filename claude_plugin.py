@@ -135,6 +135,7 @@ WRITE_CODE = (
 
 _runners = {}    # «v<id del chat>» o «w<id de ventana>» (consultas sin chat) -> consulta en curso
 _sessions = {}   # id del chat -> proceso de Claude que sigue vivo entre mensajes
+_panels = {}     # id de ventana -> permisos en espera, (clave, abrir panel); el primero está en pantalla
 _account = {}    # "api": True si el CLI usa una clave de API (se paga por token)
 _quota = {}      # tipo de límite de uso -> cuánto va usado, según el último aviso del CLI
 _tasks = {}      # id del chat -> asuntos de las tareas que Claude creó, en orden
@@ -484,6 +485,7 @@ def _begin_turn(view):
 # --- Controles desplegables ---------------------------------------------------
 
 BAR = "claude_bar"
+PERMIT = "claude_permit"
 BAR_STYLE = (
     "<style>"
     "div.bar { padding: 0.2rem 0 0.3rem 0; font-size: 0.9rem; }"
@@ -495,6 +497,36 @@ BAR_STYLE = (
     "span.detail { color: color(var(--foreground) alpha(0.55)); font-size: 0.85rem; }"
     "</style>"
 )
+
+
+def _panel_queue(window, key, open_panel):
+    """Un panel de permiso a la vez: abrir otro encima haría desaparecer el primero."""
+    queue = _panels.setdefault(window.id(), [])
+    queue.append((key, open_panel))
+    if len(queue) == 1:
+        open_panel()
+
+
+def _panel_done(window, key, hide):
+    """Un permiso quedó resuelto: sale de la cola y, si era el visible, pasa el siguiente.
+
+    hide: se resolvió sin usar su panel (desde los botones del chat o porque terminó
+    el turno), así que hay que cerrarlo.
+    """
+    queue = _panels.get(window.id(), [])
+    visible = bool(queue) and queue[0][0] == key
+    queue[:] = [item for item in queue if item[0] != key]
+    if not visible:
+        return
+    if hide:
+        window.run_command("hide_overlay")
+
+    def following():
+        while queue and not queue[0][1]():
+            queue.pop(0)
+
+    # Con retardo: Sublime no abre un panel desde el cierre de otro.
+    sublime.set_timeout(following, 10)
 
 
 def _controls(view):
@@ -1025,30 +1057,65 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
                 if preview.count("\n") > PREVIEW_OPEN:
                     view.fold(_diff_regions(view, start))
                 _fold_controls(view)
-        if shown():
-            _show_activity(turn["view"], turn, turn["label"])
 
         rule = core.permission_rule(data["tool"], data["input"])
+        key = "{}:{}".format(PERMIT, data["id"])
+        request = {"done": False}
+        waiting = turn.setdefault("permits", {})
+        waiting[key] = request
 
-        def decide(index):
-            allow = index == 0 or (index == 1 and rule is not None)
-            if allow and index == 1:
+        def settle(choice, from_panel=False):
+            """choice: "allow", "always" o "deny". Sólo cuenta la primera respuesta."""
+            if request["done"]:
+                return
+            request["done"] = True
+            waiting.pop(key, None)
+            if shown():
+                turn["view"].erase_phantoms(key)
+            allow = choice != "deny"
+            if choice == "always" and rule is not None:
                 session.allowed.add(rule)
             session.answer(data["id"], allow, data["input"])
+            _panel_done(window, key, hide=not from_panel)
             if run.get("runner") is not runner or not current():
                 return
-            turn.update(label="esperando la respuesta…", since=time.time())
+            if not waiting:
+                turn.update(label="esperando la respuesta…", since=time.time())
             if not allow:
                 say("  ✘ rechazado\n")
 
-        items = [["Permitir", what]]
+        names = [("allow", "Permitir", what)]
         if rule is not None:
             # Un comando compuesto o un intérprete no se ofrece: permitirlo siempre
             # sería permitir cualquier cosa.
-            items.append(["Permitir siempre «{}» en esta conversación".format(
-                core.rule_label(rule)), "No vuelve a preguntar por esto hasta cerrar el chat"])
-        items.append(["Rechazar", data["description"] or "Claude sigue sin hacerlo"])
-        window.show_quick_panel(items, decide, getattr(sublime, "KEEP_OPEN_ON_FOCUS_LOST", 0))
+            names.append(("always", "Permitir siempre «{}» en esta conversación".format(
+                core.rule_label(rule)), "No vuelve a preguntar por esto hasta cerrar el chat"))
+        names.append(("deny", "Rechazar", data["description"] or "Claude sigue sin hacerlo"))
+        if shown():
+            # Los mismos botones quedan en el chat: si el panel se pierde (otro panel lo
+            # tapó, se cambió de ventana), la respuesta se puede dar desde aquí.
+            view = turn["view"]
+            point = max(0, view.size() - 1)
+            view.add_phantom(
+                key, sublime.Region(point, point),
+                '<body id="claude-permit">{}<div class="bar">{}</div></body>'.format(
+                    BAR_STYLE, "&nbsp;&nbsp;".join(
+                        '<a class="chip" href="{}">{}</a>'.format(choice, html.escape(label))
+                        for choice, label, _ in names)),
+                getattr(sublime, "LAYOUT_BLOCK", 2), settle)
+            _show_activity(view, turn, turn["label"])
+
+        def open_panel():
+            if request["done"]:
+                return False
+            # Cerrar el panel sin elegir es rechazar.
+            window.show_quick_panel(
+                [[label, detail] for _, label, detail in names],
+                lambda index: settle(names[index][0] if index >= 0 else "deny", True),
+                getattr(sublime, "KEEP_OPEN_ON_FOCUS_LOST", 0))
+            return True
+
+        _panel_queue(window, key, open_panel)
 
     def show_limit(info):
         text = core.limit_text(info)
@@ -1179,6 +1246,13 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
 
     def finish(code, stderr, stopped):
         run["finished"] = True
+        for key, request in list(turn.pop("permits", {}).items()):
+            # El turno terminó con un permiso sin responder (se detuvo, o se cerró el
+            # chat): ya no hay qué decidir, y la cola de paneles no debe quedar trabada.
+            request["done"] = True
+            if turn["view"] is not None and turn["view"].is_valid():
+                turn["view"].erase_phantoms(key)
+            _panel_done(window, key, hide=True)
         if current():
             _runners.pop(run["key"], None)
         if status_view is not None and status_view.is_valid():
