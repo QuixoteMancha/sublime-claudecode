@@ -3,15 +3,42 @@
 	"claude_path": "claude",
 
 	// Modelo y esfuerzo; vacío usa lo que tenga configurado Claude Code.
-	// El modelo también se cambia con «Claude: Elegir modelo…».
+	// Se cambian también con «Claude: Elegir modelo…» y «Claude: Elegir esfuerzo…»
+	// (low, medium, high, xhigh, max: cuánto razona antes de responder).
 	"model": "",
 	"effort": "",
+
+	// Modelo al que se recurre si el elegido está saturado; vacío, ninguno.
+	"fallback_model": "",
 
 	// Herramientas de las consultas de sólo lectura (preguntas y revisiones).
 	"read_tools": "Read,Grep,Glob",
 
 	// Herramientas de los comandos que editan y del chat cuando puede editar.
 	"edit_tools": "Read,Edit,Write,Grep,Glob",
+
+	// Investigación en la web, en todos los modos: buscar y leer páginas.
+	// Vacío deja a Claude sólo con lo que hay en el proyecto.
+	"web_tools": "WebSearch,WebFetch",
+
+	// Subagentes (para búsquedas amplias sin llenar el contexto) y lista de tareas,
+	// en todos los modos. Vacío los quita.
+	"agent_tools": "Agent,TaskCreate,TaskUpdate,TaskList",
+
+	// Reglas de permiso de Claude Code que se usan sin preguntar. De fábrica, la web.
+	// Se pueden sumar comandos que sólo miran, por ejemplo:
+	//   ["WebSearch", "WebFetch", "Bash(git log *)", "Bash(git diff *)", "Bash(pytest *)"]
+	// Sin "WebSearch" y "WebFetch" aquí, cada búsqueda pide aprobación en el editor
+	// (y sin "persistent_chat" se rechaza, porque no hay quién pregunte).
+	"allowed_tools": ["WebSearch", "WebFetch"],
+
+	// Le pide a Claude un método: investigar antes de responder, reproducir y verificar
+	// cuando puede ejecutar, citar `ruta:línea`, consultar documentación oficial en la
+	// web y dar sus fuentes. Con false sólo se le dice en qué modo está el chat.
+	"work_method": true,
+
+	// Instrucciones tuyas que se suman al final (convenciones, idioma, preferencias).
+	"custom_instructions": "",
 
 	// El chat deja un proceso de Claude vivo por conversación en vez de lanzar uno por
 	// mensaje: responde antes y puede pedir permiso. Si ese proceso no arranca, el
@@ -26,12 +53,17 @@
 	// ni en «Revertir la última edición».
 	"ask_tools": "Bash",
 
+	// Lo mismo para los modos de sólo lectura y plan: con Bash, Claude puede correr
+	// las pruebas, consultar git o reproducir un error para diagnosticar, y cada
+	// comando se aprueba en el editor. Vacío: en esos modos sólo lee.
+	"read_ask_tools": "Bash",
+
 	// Respalda cada archivo antes de que Claude lo edite, para mostrar el diff
 	// al terminar y poder revertir. Necesita python3 en el sistema.
 	"review_edits": true,
 
 	// Si el chat nace pudiendo editar archivos. Con false nace de sólo lectura y se
-	// habilita con «Permitir o impedir que el chat edite archivos» (Ctrl+Alt+C, M).
+	// habilita con el desplegable de modo o «Elegir modo del chat…» (Ctrl+Alt+C, U).
 	"chat_edit_default": false,
 
 	// El diff de una edición llega plegado, un pliegue por archivo; se abre con
@@ -42,12 +74,32 @@
 	// con las primeras a la vista. 0 no pliega nunca.
 	"fold_code_lines": 40,
 
+	// Bajo el encabezado de cada bloque plegable (diff, código largo, guion de un
+	// permiso) hay un control «▸ mostrar N líneas» / «▾ plegar» que se usa con un clic.
+	"fold_controls": true,
+
+	// Herramientas cuya salida queda escrita en el chat, plegada bajo «↳ salida»:
+	// nombres separados por comas, "*" para todas o "" para ninguna.
+	"tool_output": "Bash",
+
+	// El razonamiento de Claude, cuando el modelo lo entrega, queda plegado bajo
+	// «✻ razonamiento».
+	"show_thinking": true,
+
+	// Tras una edición, los errores que LSP marque en los archivos tocados (si están
+	// abiertos) se anotan en el chat y viajan con el mensaje siguiente.
+	"check_after_edit": true,
+
 	// Los errores y advertencias que LSP tenga del archivo abierto viajan como contexto.
 	"context_diagnostics": true,
 
 	// Agrega a la línea de cierre el costo que informa el CLI (con suscripción es
 	// sólo referencial).
 	"show_cost": false,
+
+	// Barra de controles sobre la línea donde se escribe: tres desplegables (modo,
+	// modelo y esfuerzo) que se abren con un clic.
+	"chat_controls": true,
 
 	// Dónde se abre el chat: "right" (columna a la derecha) o "tab" (una pestaña más).
 	"chat_position": "right",
@@ -59,7 +111,7 @@
 	// Segundos que se espera a pytest en «Correr las pruebas».
 	"test_timeout": 300,
 
-	// Servidor de «Ver el estado del servidor» y «Diagnosticar logs del servidor»:
+	// Servidor de «Diagnosticar logs del servidor»:
 	// un nombre o IP, o "usuario@servidor". Se entra por SSH sin pedir clave
 	// (BatchMode), y sólo se ejecutan los dos comandos de abajo. Vacío desactiva
 	// esos comandos.

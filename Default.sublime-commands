@@ -16,16 +16,8 @@
 		"command": "claude_history"
 	},
 	{
-		"caption": "Claude: Adjuntar un archivo al mensaje…",
-		"command": "claude_attach_file"
-	},
-	{
-		"caption": "Claude: Permitir o impedir que el chat edite archivos",
-		"command": "claude_toggle_edit"
-	},
-	{
-		"caption": "Claude: Dejar un mensaje en cola…",
-		"command": "claude_queue_message"
+		"caption": "Claude: Compactar la conversación",
+		"command": "claude_compact"
 	},
 	{
 		"caption": "Claude: Elegir modo del chat (lectura, plan, edición)…",
@@ -40,6 +32,10 @@
 		"command": "claude_select_model"
 	},
 	{
+		"caption": "Claude: Elegir esfuerzo…",
+		"command": "claude_select_effort"
+	},
+	{
 		"caption": "Claude: Revisar errores de este archivo",
 		"command": "claude_review_file"
 	},
@@ -50,10 +46,6 @@
 	{
 		"caption": "Claude: Explicar errores del último build",
 		"command": "claude_explain_build"
-	},
-	{
-		"caption": "Claude: Explicar el error copiado en el portapapeles",
-		"command": "claude_explain_clipboard"
 	},
 	{
 		"caption": "Claude: Escribir código aquí…",
@@ -84,23 +76,12 @@
 		"command": "claude_commit_message"
 	},
 	{
-		"caption": "Claude: Ver el estado del servidor",
-		"command": "claude_remote_status"
-	},
-	{
 		"caption": "Claude: Diagnosticar logs del servidor…",
 		"command": "claude_remote_logs"
 	},
 	{
 		"caption": "Claude: Abrir en terminal",
 		"command": "claude_terminal"
-	},
-	{
-		"caption": "Claude: Abrir en terminal con este archivo",
-		"command": "claude_terminal",
-		"args": {
-			"with_file": true
-		}
 	},
 	{
 		"caption": "Claude: Detener",

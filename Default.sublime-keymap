@@ -90,23 +90,9 @@
 	{
 		"keys": [
 			"ctrl+alt+c",
-			"i"
+			"x"
 		],
-		"command": "claude_attach_file"
-	},
-	{
-		"keys": [
-			"ctrl+alt+c",
-			"m"
-		],
-		"command": "claude_toggle_edit"
-	},
-	{
-		"keys": [
-			"ctrl+alt+c",
-			"q"
-		],
-		"command": "claude_queue_message"
+		"command": "claude_compact"
 	},
 	{
 		"keys": [
@@ -132,6 +118,13 @@
 	{
 		"keys": [
 			"ctrl+alt+c",
+			"f"
+		],
+		"command": "claude_select_effort"
+	},
+	{
+		"keys": [
+			"ctrl+alt+c",
 			"r"
 		],
 		"command": "claude_review_file"
@@ -149,13 +142,6 @@
 			"b"
 		],
 		"command": "claude_explain_build"
-	},
-	{
-		"keys": [
-			"ctrl+alt+c",
-			"x"
-		],
-		"command": "claude_explain_clipboard"
 	},
 	{
 		"keys": [
@@ -209,13 +195,6 @@
 	{
 		"keys": [
 			"ctrl+alt+c",
-			"v"
-		],
-		"command": "claude_remote_status"
-	},
-	{
-		"keys": [
-			"ctrl+alt+c",
 			"o"
 		],
 		"command": "claude_remote_logs"
@@ -226,16 +205,6 @@
 			"t"
 		],
 		"command": "claude_terminal"
-	},
-	{
-		"keys": [
-			"ctrl+alt+c",
-			"f"
-		],
-		"command": "claude_terminal",
-		"args": {
-			"with_file": true
-		}
 	},
 	{
 		"keys": [

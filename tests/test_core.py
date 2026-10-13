@@ -44,7 +44,9 @@ class ParseLine(unittest.TestCase):
                          [("activity", "preparando Edit…")])
         done = line(type="user", message={"content": [
             {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]})
-        self.assertEqual(core.parse_line(done), [("activity", "esperando la respuesta…")])
+        self.assertEqual(core.parse_line(done), [
+            ("output", {"id": "t1", "text": "ok", "error": False}),
+            ("activity", "esperando la respuesta…")])
         self.assertEqual(core.parse_line(line(type="user", message={"content": "hola"})), [])
         sub = line(type="user", parent_tool_use_id="t9", message={"content": [
             {"type": "tool_result", "tool_use_id": "t2", "content": "ok"}]})
@@ -134,6 +136,84 @@ class Helpers(unittest.TestCase):
         asks = core.chat_note("Read,Edit,Bash", True, asks=True)
         self.assertIn("aprueba cada uno", asks)
         self.assertNotIn("aprueba cada uno", core.chat_note("Read,Edit,Bash", True))
+
+    def test_web_metodo_y_permisos_por_regla(self):
+        args = core.build_args("claude", "Read", model="opus", fallback="sonnet",
+                               allowed=["WebSearch", "", "Bash(git log *)"], extra=["--x"])
+        start = args.index("--allowedTools")
+        self.assertEqual(args[start + 1:], ["WebSearch", "Bash(git log *)", "--x"])
+        self.assertEqual(args[args.index("--fallback-model") + 1], "sonnet")
+        plain = core.build_args("claude", "Read", model="opus", fallback="opus", allowed=[])
+        self.assertNotIn("--allowedTools", plain)
+        self.assertNotIn("--fallback-model", plain)
+
+        read = core.method_note("Read,Grep,Glob")
+        self.assertIn("No puedes ejecutar nada", read)
+        self.assertNotIn("WebSearch", read)
+        full = core.method_note("Read,Bash,WebSearch,WebFetch,Agent")
+        for expected in ("reproduce el fallo", "da la URL", "subagente", "`ruta:línea`"):
+            self.assertIn(expected, full)
+        watch = core.chat_note("Read,Bash", False, asks=True)
+        self.assertIn("son para observar", watch)
+        self.assertNotIn("son para observar", core.chat_note("Read,Edit,Bash", True, asks=True))
+
+        rule = core.permission_rule
+        self.assertEqual(rule("Bash", {"command": "pytest  -q tests"}), ("Bash", "pytest"))
+        self.assertEqual(rule("Bash", {"command": "git log --oneline"}), ("Bash", "git log"))
+        for command in ("pytest -q; rm -rf x", "ls | sh", "python3 -c 'x'", "git --version",
+                        "A=1 pytest", "echo $(id)", "ls > x", "echo 'sin cerrar", "",
+                        "/usr/bin/sudo ls", "ls\nrm x"):
+            self.assertIsNone(rule("Bash", {"command": command}), command)
+        self.assertEqual(rule("WebFetch", {"url": "https://Docs.Python.org/3/x"}),
+                         ("WebFetch", "docs.python.org"))
+        self.assertIsNone(rule("WebFetch", {}))
+        self.assertEqual(rule("Edit", {"file_path": "/x"}), ("Edit", ""))
+        self.assertEqual(core.rule_label(("Bash", "git log")), "Bash git log …")
+        self.assertEqual(core.rule_label(("Edit", "")), "Edit")
+        allowed = {("Bash", "pytest"), ("WebSearch", ""), "Read"}
+        self.assertTrue(core.rule_allows(allowed, "Bash", {"command": "pytest -x"}))
+        self.assertFalse(core.rule_allows(allowed, "Bash", {"command": "pytest -x && ls"}))
+        self.assertFalse(core.rule_allows(allowed, "Bash", {"command": "ls"}))
+        self.assertTrue(core.rule_allows(allowed, "WebSearch", {"query": "x"}))
+        self.assertTrue(core.rule_allows(allowed, "Read", {}))
+        self.assertEqual(core.tool_summary("Agent", {"description": "busca usos"}),
+                         "Agent busca usos")
+
+    def test_salidas_razonamiento_y_citas_plegables(self):
+        delta = line(type="stream_event", event={
+            "type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "a ver"}})
+        self.assertEqual(core.parse_line(delta), [("thinking", "a ver")])
+        done = line(type="user", message={"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "is_error": True,
+             "content": [{"type": "text", "text": "exit 1\n"}, {"type": "image"}]},
+            {"type": "tool_result", "tool_use_id": "t2", "content": "  \n"}]})
+        self.assertEqual(core.parse_line(done), [
+            ("output", {"id": "t1", "text": "exit 1", "error": True}),
+            ("activity", "esperando la respuesta…")])
+        tools = {}
+        self.assertEqual(core._untag(tools, "tool", ("t1", "Bash ls")), (True, "Bash ls"))
+        self.assertEqual(core._untag(tools, "tool", ("t1", "Bash ls")), (False, None))
+        self.assertEqual(core._untag(tools, "output", {"id": "t1", "text": "x"}),
+                         (True, {"id": "t1", "text": "x", "tool": "Bash ls"}))
+        self.assertEqual(core._untag(tools, "text_start", None), (True, None))
+
+        block = core.quote_block("  ↳ salida · Bash ls", "a\n\nb\n")
+        self.assertEqual(block, "  ↳ salida · Bash ls\n  │ a\n  │\n  │ b\n")
+        long = core.quote_block("  ↳ x", "\n".join(str(n) for n in range(500)), max_lines=50,
+                                tail=10)
+        self.assertIn("  │ 39\n  │ … 450 líneas omitidas …\n  │ 490\n", long)
+        self.assertTrue(long.endswith("  │ 499\n"))
+        text = "hola\n" + block + "\ntexto\n  ✻ razonamiento\n  │ pienso\n  ↳ sin cuerpo\nfin"
+        self.assertEqual([text[a:b] for a, b in core.quote_folds(text)],
+                         ["\n  │ a\n  │\n  │ b", "\n  │ pienso"])
+        self.assertEqual(core.quote_folds("  │ suelta\nnada"), [])
+
+        folder = tempfile.mkdtemp(prefix="claude-st-")
+        self.addCleanup(__import__("shutil").rmtree, folder, True)
+        open(os.path.join(folder, "a.py"), "w").close()
+        self.assertEqual(
+            core.mentioned_files("mira @a.py:10-40, @a.py:7 y @b.py:3 y @a.py.", folder),
+            ["a.py:10-40", "a.py:7", "a.py"])
 
     def test_contexto_y_limite_de_uso(self):
         result = {"modelUsage": {"a": {"contextWindow": 200000}, "b": {"contextWindow": 1000}}}
@@ -454,14 +534,6 @@ class Extras(unittest.TestCase):
         self.assertEqual([core.age_text(n) for n in (5, 120, 7200, 200000)],
                          ["recién", "hace 2 min", "hace 2 h", "hace 2 d"])
 
-    def test_estado_de_los_servicios(self):
-        problems, healthy = core.service_report([
-            ("web", "Up 3 days"), ("api", "Up 2 hours (healthy)"), ("ml", "Up 5 minutes (unhealthy)"),
-            ("cola", "Restarting (1) 5 seconds ago"), ("viejo", "Exited (137) 2 days ago"),
-            ("nginx.service", "running")])
-        self.assertEqual([name for name, _ in problems], ["ml", "cola", "viejo"])
-        self.assertEqual([name for name, _ in healthy], ["web", "api", "nginx.service"])
-
 
 FAKE_CLI = r'''
 import json, sys
@@ -545,7 +617,7 @@ class LiveSession(unittest.TestCase):
         events, _ = self.ask("corre ls", lambda data: self.session.answer(data["id"], False))
         self.assertIn(("text", "2:deny null"), events)
         # Lo permitido para toda la conversación ya no se pregunta.
-        self.session.allowed.add("Bash")
+        self.session.allowed.add(("Bash", "ls"))
         events, _ = self.ask("corre ls", lambda data: self.fail("no debía preguntar"))
         self.assertIn(("text", '3:allow {"command": "ls"}'), events)
         self.assertNotIn("permission", [kind for kind, _ in events])

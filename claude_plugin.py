@@ -1,4 +1,5 @@
 """Claude Code dentro de Sublime Text: un chat en una pestaña, edición y terminal."""
+import html
 import os
 import re
 import shutil
@@ -34,12 +35,17 @@ K_NOTICE = "claude_notice"
 K_PLAN = "claude_plan"
 K_NUMBER = "claude_number"
 K_LIMIT = "claude_limit"
+K_NOTE = "claude_mode_note"
+K_BACKUPS = "claude_edits"
 
 HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "snapshot.py")
 REMOTE_LIST = "docker ps -a --format '{{.Names}}\\t{{.Status}}'"
 REMOTE_LOGS = "docker logs --tail {lines} {name} 2>&1"
 
 REFERENCE = re.compile(r"([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+):(\d+)")
+SLASH = re.compile(r"^/[\w:-]+(\s|$)")  # un comando de Claude Code, no una ruta
+BACKUPS_KEPT = 10
+TABS_LIMIT = 12
 HISTORY_COMMANDS = ("undo", "redo", "redo_or_repeat", "soft_undo", "soft_redo")
 
 REVIEW_FILE = (
@@ -86,11 +92,6 @@ COMMIT_MESSAGE = (
     "sin comillas ni bloque ```.\n\n<ultimos_commits>\n{subjects}</ultimos_commits>\n\n"
     "<diff>\n{diff}</diff>"
 )
-EXPLAIN_ERROR = (
-    "Este error salió al ejecutar código de este proyecto. Explica la causa y propone la "
-    "corrección, citando `ruta:línea`. Lee los archivos que necesites, pero no modifiques "
-    "nada."
-)
 REMOTE_DIAGNOSE = (
     "Estos son los últimos {lines} registros de `{name}` en el servidor `{host}`. "
     "Diagnostica: qué errores hay, su causa probable y qué revisar o corregir. Si el "
@@ -106,9 +107,18 @@ FIX_TESTS = (
 )
 MODELS = (
     ("", "Predeterminado", "El que tenga configurado Claude Code"),
+    ("fable", "Fable", "El de mayor alcance: problemas largos y difíciles"),
     ("opus", "Opus", "El más capaz: revisiones y cambios delicados"),
     ("sonnet", "Sonnet", "Equilibrado: el trabajo de todos los días"),
     ("haiku", "Haiku", "El más rápido: preguntas cortas"),
+)
+EFFORTS = (
+    ("", "Predeterminado", "El que tenga configurado Claude Code"),
+    ("low", "Bajo", "Preguntas cortas y cambios mecánicos"),
+    ("medium", "Medio", "El trabajo de todos los días"),
+    ("high", "Alto", "Razona más antes de responder"),
+    ("xhigh", "Muy alto", "Bugs difíciles y cambios que cruzan varios archivos"),
+    ("max", "Máximo", "Lo más a fondo que puede; tarda y gasta más"),
 )
 WRITE_CODE = (
     "Escribe código para {action} en `{name}`{syntax}.\n\n"
@@ -306,10 +316,65 @@ def _diff_regions(view, start=0):
     return [sublime.Region(start + a, start + b) for a, b, _, _ in core.diff_folds(text)]
 
 
+def _script_regions(view):
+    return [region for region in view.get_regions(SCRIPTS) if not region.empty()]
+
+
 def _code_regions(view, start=0):
     text = view.substr(sublime.Region(start, view.size()))
     lines = int(_settings().get("fold_code_lines", 40) or 0)
-    return [sublime.Region(start + a, start + b) for a, b in core.code_folds(text, lines)]
+    scripts = _script_regions(view)
+    regions = [sublime.Region(start + a, start + b) for a, b in core.code_folds(text, lines)]
+    # El guion de un permiso se pliega entero: no lleva además el pliegue de código largo.
+    return [region for region in regions if not any(
+        script.begin() <= region.begin() and region.end() <= script.end()
+        for script in scripts)]
+
+
+def _quote_regions(view, start=0):
+    text = view.substr(sublime.Region(start, view.size()))
+    return [sublime.Region(start + a, start + b) for a, b in core.quote_folds(text)]
+
+
+FOLDS = "claude_folds"
+SCRIPTS = "claude_scripts"  # guiones de un permiso, plegados: no se deducen del texto
+
+
+def _foldable(view):
+    """Todo lo que se puede plegar en el chat: diffs, código largo, citas y guiones."""
+    return (_diff_regions(view) + _code_regions(view) + _quote_regions(view)
+            + _script_regions(view))
+
+
+def _fold_controls(view):
+    """Pone bajo el encabezado de cada bloque plegable un control que lo abre o lo cierra."""
+    if not view.is_valid():
+        return
+    view.erase_phantoms(FOLDS)
+    if not _settings().get("fold_controls", True):
+        return
+    folded = {(region.begin(), region.end()) for region in view.folded_regions()}
+    for region in _foldable(view):
+        closed = (region.begin(), region.end()) in folded
+        lines = view.substr(region).count("\n")
+        label = "▸ mostrar {} línea{}".format(lines, "" if lines == 1 else "s") if closed \
+            else "▾ plegar"
+        view.add_phantom(
+            FOLDS, sublime.Region(region.begin(), region.begin()),
+            '<body id="claude-fold">{}<div class="fold"><a class="chip" href="x">{}</a></div>'
+            '</body>'.format(BAR_STYLE, label),
+            getattr(sublime, "LAYOUT_BLOCK", 2),
+            lambda _, region=region, closed=closed: _toggle_fold(view, region, closed))
+
+
+def _toggle_fold(view, region, closed):
+    # Manda lo que decía el control: si el bloque ya se abrió desde la marca «…», el
+    # clic sólo pone el control al día.
+    if closed:
+        view.unfold(region)
+    else:
+        view.fold(region)
+    _fold_controls(view)
 
 
 def _fold_diffs(view, start=0):
@@ -324,6 +389,36 @@ def _fold_code(view, start=0):
     regions = _code_regions(view, start)
     if regions:
         view.fold(regions)
+
+
+def _fold_quotes(view, start=0):
+    """Pliega las salidas de herramientas y el razonamiento: queda su encabezado."""
+    regions = _quote_regions(view, start)
+    if regions:
+        view.fold(regions)
+        _fold_controls(view)
+
+
+def _backups(view):
+    """Respaldos de las ediciones del chat que se pueden revertir, del más viejo al último."""
+    state = view.settings()
+    stack = [path for path in state.get(K_BACKUPS) or [] if os.path.isdir(path)]
+    last = state.get(K_BACKUP)
+    if last and last not in stack and os.path.isdir(last):
+        stack.append(last)
+    return stack
+
+
+def _set_backups(view, stack):
+    state = view.settings()
+    for old in stack[:-BACKUPS_KEPT]:
+        shutil.rmtree(old, ignore_errors=True)
+    stack = stack[-BACKUPS_KEPT:]
+    state.set(K_BACKUPS, stack)
+    if stack:
+        state.set(K_BACKUP, stack[-1])
+    else:
+        state.erase(K_BACKUP)
 
 
 def _tail(view):
@@ -351,6 +446,7 @@ def _begin_turn(view):
     draft = ""
     if start is not None:
         settings.erase(K_START)
+        view.erase_phantoms(BAR)
         start = min(start, view.size())
         draft = view.substr(sublime.Region(start, view.size()))
         view.set_read_only(False)
@@ -358,6 +454,119 @@ def _begin_turn(view):
             "a": max(0, start - len(MARK)), "b": view.size(), "text": ""})
     view.set_read_only(True)
     return draft
+
+
+# --- Controles desplegables ---------------------------------------------------
+
+BAR = "claude_bar"
+BAR_STYLE = (
+    "<style>"
+    "div.bar { padding: 0.2rem 0 0.3rem 0; font-size: 0.9rem; }"
+    "div.item { padding: 0.15rem 0.3rem; }"
+    "div.fold { padding: 0.1rem 0 0.2rem 0; font-size: 0.85rem; }"
+    "a { text-decoration: none; color: var(--foreground); }"
+    "a.chip { background-color: color(var(--foreground) alpha(0.1)); "
+    "padding: 0.1rem 0.5rem; border-radius: 0.3rem; }"
+    "span.detail { color: color(var(--foreground) alpha(0.55)); font-size: 0.85rem; }"
+    "</style>"
+)
+
+
+def _controls(view):
+    """Los desplegables del chat: (clave, etiqueta, [(nombre, detalle)], opción vigente)."""
+    settings, state = _settings(), view.settings()
+    mode = 2 if state.get(K_EDIT) else 1 if state.get(K_PLAN) else 0
+    controls = [("mode", ("Sólo lectura", "◇ Plan", "✎ Edición")[mode],
+                 [(name, detail) for name, detail, _ in ClaudeChatModeCommand.MODES], mode)]
+    for key, title, options in (("model", "Modelo", MODELS), ("effort", "Esfuerzo", EFFORTS)):
+        value = settings.get(key) or ""
+        values = [option[0] for option in options]
+        current = values.index(value) if value in values else -1
+        name = options[current][1].lower() if current >= 0 else value
+        controls.append((key, "{}: {}".format(title, name),
+                         [(name, detail) for _, name, detail in options], current))
+    return controls
+
+
+def _bar_point(view):
+    """Dónde va la barra: en la línea en blanco que precede a la marca."""
+    start = view.settings().get(K_START) or 0
+    return max(0, start - len(MARK) - 1)
+
+
+def _show_bar(view):
+    """Pone (o quita) la barra de controles sobre la marca donde se escribe."""
+    if not view.is_valid():
+        return
+    view.erase_phantoms(BAR)
+    if view.settings().get(K_START) is None or not _settings().get("chat_controls", True):
+        return
+    point = _bar_point(view)
+    chips = "&nbsp;&nbsp;".join(
+        '<a class="chip" href="{}">{} ▾</a>'.format(key, html.escape(label))
+        for key, label, _, _ in _controls(view))
+    state = view.settings()
+    if state.get(K_PLAN) and state.get(K_SESSION):
+        # Hay un plan sobre la mesa: un clic pasa a edición y pide aplicarlo.
+        chips += '&nbsp;&nbsp;<a class="chip" href="apply">▶ Aplicar el plan</a>'
+    view.add_phantom(
+        BAR, sublime.Region(point, point),
+        '<body id="claude-bar">{}<div class="bar">{}</div></body>'.format(BAR_STYLE, chips),
+        getattr(sublime, "LAYOUT_BLOCK", 2),
+        lambda key: _apply_plan(view) if key == "apply" else _dropdown(view, key))
+
+
+def _send_text(view, text):
+    """Envía un mensaje como si se hubiera escrito en el chat; False si no se puede ahora."""
+    start = view.settings().get(K_START)
+    if not view.is_valid() or start is None:
+        return False
+    view.run_command("claude_chat_replace", {"a": start, "b": view.size(), "text": text})
+    view.run_command("claude_chat_send")
+    return True
+
+
+def _apply_plan(view):
+    start = view.settings().get(K_START)
+    if start is None:
+        return
+    # Lo que hubiera a medio escribir se suma como ajuste al plan.
+    draft = view.substr(sublime.Region(start, view.size())).strip()
+    _set_edit(view, True)
+    _send_text(view, "Aplica el plan que propusiste.{}".format("\n" + draft if draft else ""))
+
+
+def _refresh_bars(window):
+    for view in _chats(window):
+        _show_bar(view)
+
+
+def _dropdown(view, key):
+    """Despliega las opciones de un control justo donde está la barra."""
+    window = view.window()
+    found = [control for control in _controls(view) if control[0] == key]
+    if window is None or not found:
+        return
+    _, _, options, current = found[0]
+    rows = "".join(
+        '<div class="item"><a href="{}:{}">{} {}</a> <span class="detail">{}</span></div>'.format(
+            key, index, "●" if index == current else "○", html.escape(name),
+            html.escape(detail))
+        for index, (name, detail) in enumerate(options))
+
+    def pick(href):
+        view.hide_popup()
+        index = int(href.rpartition(":")[2])
+        if key == "mode":
+            ClaudeChatModeCommand(window).choose(view, index)
+        elif key == "model":
+            ClaudeSelectModelCommand(window).choose(index)
+        else:
+            ClaudeSelectEffortCommand(window).choose(index)
+
+    view.show_popup(
+        '<body id="claude-dropdown">{}{}</body>'.format(BAR_STYLE, rows),
+        location=_bar_point(view), max_width=640, max_height=480, on_navigate=pick)
 
 
 def _end_turn(view, draft=""):
@@ -369,6 +578,8 @@ def _end_turn(view, draft=""):
     start = view.size() - len(draft)
     _transcripts[view.id()] = view.substr(sublime.Region(0, start))
     view.settings().set(K_START, start)
+    _show_bar(view)
+    _fold_controls(view)
     view.set_read_only(False)
     view.sel().clear()
     view.sel().add(sublime.Region(view.size(), view.size()))
@@ -393,6 +604,7 @@ def _rename(view):
     view.set_name("Claude{}{}".format(
         " {}".format(number) if number > 1 else "",
         " ✎" if state.get(K_EDIT) else " ◇" if state.get(K_PLAN) else ""))
+    _show_bar(view)
 
 
 def _set_edit(view, enabled):
@@ -415,20 +627,43 @@ def _mode_label(view):
         else "sólo lectura"
 
 
+def _system(note, tools):
+    """Lo que se agrega al prompt de sistema: el modo, el método y lo que pida el usuario."""
+    settings = _settings()
+    parts = [note, core.method_note(tools) if settings.get("work_method", True) else "",
+             str(settings.get("custom_instructions") or "").strip()]
+    return "\n\n".join(part for part in parts if part) or None
+
+
+def _read_tools():
+    """Herramientas de los comandos que sólo leen: las de lectura, la web y los subagentes."""
+    settings = _settings()
+    return core.join_tools(
+        settings.get("read_tools", core.READ_TOOLS),
+        settings.get("web_tools", core.WEB_TOOLS),
+        settings.get("agent_tools", core.AGENT_TOOLS))
+
+
 def _chat_mode(view):
-    """Con qué se lanza un mensaje del chat: (herramientas, modo de permisos, nota)."""
+    """Con qué se lanza un mensaje del chat: (herramientas, modo de permisos, nota, sistema).
+
+    La nota dice en qué modo está el chat; el sistema la lleva junto con el método.
+    """
     settings, state = _settings(), view.settings()
     live = _live_enabled()
-    if state.get(K_EDIT):
-        tools = settings.get("edit_tools", core.EDIT_TOOLS)
-        if live:
-            # Lo que necesita aprobación sólo se ofrece si hay quién la pida.
-            tools = core.join_tools(tools, settings.get("ask_tools", "Bash"))
-        return tools, "acceptEdits", core.chat_note(tools, True, asks=live)
-    tools = settings.get("read_tools", core.READ_TOOLS)
-    if state.get(K_PLAN):
-        return tools, "plan", core.chat_note(tools, False, plan=True)
-    return tools, None, core.chat_note(tools, False)
+    edit, plan = bool(state.get(K_EDIT)), bool(state.get(K_PLAN))
+    # Lo que necesita aprobación sólo se ofrece si hay quién la pida.
+    asked = settings.get("ask_tools", "Bash") if edit \
+        else settings.get("read_ask_tools", "Bash")
+    tools = core.join_tools(
+        settings.get("edit_tools", core.EDIT_TOOLS) if edit
+        else settings.get("read_tools", core.READ_TOOLS),
+        settings.get("web_tools", core.WEB_TOOLS),
+        settings.get("agent_tools", core.AGENT_TOOLS),
+        asked if live else "")
+    note = core.chat_note(tools, edit, plan=plan and not edit, asks=live)
+    mode = "acceptEdits" if edit else "plan" if plan else None
+    return tools, mode, note, _system(note, tools)
 
 
 # --- Contexto del editor ----------------------------------------------------
@@ -449,6 +684,7 @@ class _Context(object):
     """Lo que el editor sabe en el momento de la consulta."""
 
     def __init__(self, window):
+        self.window = window
         self.view = _file_view(window)
         view = self.view
         self.path = view.file_name() if view else None
@@ -463,6 +699,10 @@ class _Context(object):
                 if not region.empty():
                     self.region = region
                     break
+        # Sin selección, la línea del cursor dice de qué parte del archivo se habla.
+        self.row = None
+        if view and self.path and not self.dirty and self.region is None and len(view.sel()):
+            self.row = view.rowcol(view.sel()[0].begin())[0] + 1
         self.diagnostics = []
         if view and self.path and _settings().get("context_diagnostics", True):
             # Sólo errores y advertencias, y pocos: es contexto, no la tarea.
@@ -475,7 +715,7 @@ class _Context(object):
             return []
         region = [self.region.begin(), self.region.end()] if self.region else []
         changes = view.change_count() if self.dirty or not self.path else 0
-        return [self.path or view.id(), region, changes, self.diagnostics]
+        return [self.path or view.id(), region, changes, self.diagnostics, self.row]
 
     def describe(self):
         """Texto que acompaña al prompt: archivo, búfer sin guardar y selección."""
@@ -484,7 +724,8 @@ class _Context(object):
             return ""
         parts = []
         if self.path and not self.dirty:
-            parts.append("Archivo abierto en el editor: `{}`.".format(self.rel))
+            parts.append("Archivo abierto en el editor: `{}`{}.".format(
+                self.rel, ", con el cursor en la línea {}".format(self.row) if self.row else ""))
         elif view.size():
             diff = None
             if self.path:
@@ -516,7 +757,20 @@ class _Context(object):
         if self.diagnostics:
             parts.append("Avisos del linter en ese archivo:\n{}".format(
                 "\n".join(self.diagnostics)))
+        tabs = self.tabs()
+        if tabs:
+            parts.append("Otras pestañas abiertas: {}.".format(
+                ", ".join("`{}`".format(name) for name in tabs)))
         return "\n\n".join(parts)
+
+    def tabs(self):
+        """Los demás archivos del proyecto que están abiertos: suelen ser parte de la tarea."""
+        prefix, names = self.cwd.rstrip(os.sep) + os.sep, []
+        for view in self.window.views():
+            path = view.file_name()
+            if path and path != self.path and path.startswith(prefix) and not _is_chat(view):
+                names.append(path[len(prefix):])
+        return sorted(set(names))[:TABS_LIMIT]
 
 
 def _with_context(prompt, context):
@@ -527,11 +781,12 @@ def _with_context(prompt, context):
 # --- Consultas --------------------------------------------------------------
 
 def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
-         context=None, quiet=False, on_result=None, chat=None, system=None):
+         context=None, quiet=False, on_result=None, chat=None, system=None, note=None):
     """Lanza una consulta y escribe la respuesta en el chat.
 
     chat: el mensaje ya está escrito en ese chat (lo envió el usuario desde ahí).
     quiet: no toca el chat salvo que falle (se usa para generar código).
+    note: la nota de modo que lleva `system`; el chat la recuerda para avisar si cambia.
     """
     target = chat if chat is not None else (None if quiet else _find_chat(window))
     if (quiet and _slot(window) in _runners) or (not quiet and _busy(target)):
@@ -548,6 +803,12 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
         return
 
     user_extra = list(settings.get("extra_args") or [])
+    # Lo que no se pregunta (la web, de fábrica); sin herramientas no hay qué permitir.
+    allowed = list(settings.get("allowed_tools", ["WebSearch", "WebFetch"]) or []) \
+        if tools else []
+    if system is None and tools and not quiet:
+        # Un comando de sólo lectura: no tiene modo que explicar, pero sí método.
+        system = _system("", tools)
     python = core.find_python()
     # Un hook copia cada archivo antes de que Claude lo toque: de ahí salen el
     # diff que se muestra al terminar y la posibilidad de revertir.
@@ -589,6 +850,30 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             _line(turn["view"])
             _write(turn["view"], line)
 
+    def quoted(header, text):
+        """Un bloque citado, plegado bajo su encabezado: se abre con su control."""
+        if not shown() or not text.strip():
+            return
+        view = turn["view"]
+        _clear_activity(view, turn)
+        _line(view)
+        start = view.size()
+        _write(view, core.quote_block(header, text))
+        _fold_quotes(view, start)
+
+    def flush_thinking():
+        text = turn.pop("thinking", "")
+        if text and settings.get("show_thinking", True):
+            quoted("  ✻ razonamiento", text)
+
+    def show_output(data):
+        """Lo que devolvió una herramienta, para no depender de que Claude lo cuente."""
+        wanted = [name.strip() for name in str(settings.get("tool_output", "Bash") or "").split(",")]
+        if data["tool"].split(" ", 1)[0] in wanted or "*" in wanted:
+            label = data["tool"] if len(data["tool"]) <= 80 else data["tool"][:77] + "..."
+            quoted("  ↳ {} · {}".format("falló" if data["error"] else "salida", label),
+                   data["text"])
+
     def tick():
         """Cuenta los segundos de la espera: distingue «sigue pensando» de «se colgó»."""
         if not current():
@@ -626,16 +911,22 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
                 view = turn["view"]
                 start = view.size() + len("```bash")
                 _write(view, "```bash\n{}\n```\n".format(command))
-                view.fold(sublime.Region(start, view.size() - len("\n```\n")))
+                script = sublime.Region(start, view.size() - len("\n```\n"))
+                view.add_regions(SCRIPTS, list(view.get_regions(SCRIPTS)) + [script],
+                                 flags=getattr(sublime, "HIDDEN", 32))
+                view.fold(script)
+                _fold_controls(view)
         else:
             say("  ? pide permiso: {}\n".format(what))
         if shown():
             _show_activity(turn["view"], turn, turn["label"])
 
+        rule = core.permission_rule(data["tool"], data["input"])
+
         def decide(index):
-            allow = index in (0, 1)
-            if index == 1:
-                session.allowed.add(data["tool"])
+            allow = index == 0 or (index == 1 and rule is not None)
+            if allow and index == 1:
+                session.allowed.add(rule)
             session.answer(data["id"], allow, data["input"])
             if run.get("runner") is not runner or not current():
                 return
@@ -643,12 +934,14 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             if not allow:
                 say("  ✘ rechazado\n")
 
-        window.show_quick_panel([
-            ["Permitir", what],
-            ["Permitir siempre «{}» en esta conversación".format(data["tool"]),
-             "No vuelve a preguntar por esta herramienta hasta cerrar el chat"],
-            ["Rechazar", data["description"] or "Claude sigue sin hacerlo"],
-        ], decide, getattr(sublime, "KEEP_OPEN_ON_FOCUS_LOST", 0))
+        items = [["Permitir", what]]
+        if rule is not None:
+            # Un comando compuesto o un intérprete no se ofrece: permitirlo siempre
+            # sería permitir cualquier cosa.
+            items.append(["Permitir siempre «{}» en esta conversación".format(
+                core.rule_label(rule)), "No vuelve a preguntar por esto hasta cerrar el chat"])
+        items.append(["Rechazar", data["description"] or "Claude sigue sin hacerlo"])
+        window.show_quick_panel(items, decide, getattr(sublime, "KEEP_OPEN_ON_FOCUS_LOST", 0))
 
     def show_limit(info):
         text = core.limit_text(info)
@@ -678,6 +971,14 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             return
         if kind == "limit":
             show_limit(data)
+            return
+        if kind == "thinking":
+            turn["thinking"] = turn.get("thinking", "") + data
+            return
+        if kind != "activity":
+            flush_thinking()
+        if kind == "output":
+            show_output(data)
             return
         if kind == "permission":
             ask_permission(data)
@@ -720,10 +1021,9 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             shutil.rmtree(backup, ignore_errors=True)
             return ""
         core.mark_applied(backup)
-        previous = view.settings().get(K_BACKUP)
-        if previous and previous != backup:
-            shutil.rmtree(previous, ignore_errors=True)
-        view.settings().set(K_BACKUP, backup)
+        # Cada turno que edita deja su respaldo: revertir va deshaciendo de a uno.
+        _set_backups(view, [path for path in _backups(view) if path != backup] + [backup])
+        turn["changed"] = changed
         return ("### Cambios en {} archivo{}\n{}+{} −{} líneas{}. {}"
                 "Para deshacerlos: «Claude: Revertir la última edición».\n").format(
             len(changed), "" if len(changed) == 1 else "s",
@@ -735,6 +1035,7 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
     def close_turn(text):
         view = turn["view"]
         if view is not None and view.is_valid():
+            flush_thinking()
             _clear_activity(view, turn)
             if "from" in turn:
                 _fold_code(view, turn["from"])
@@ -749,6 +1050,10 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             _end_turn(view, turn["draft"])
             if not quiet:
                 _save_history(view)
+            files = turn.pop("changed", None)
+            if files and settings.get("check_after_edit", True):
+                # LSP tarda un momento en volver a mirar los archivos recién escritos.
+                sublime.set_timeout(lambda: _check_edits(window, view, files, cwd), 2500)
 
     def keep_queued():
         """La respuesta no llegó a buen término: lo que estaba en cola vuelve al borrador."""
@@ -793,6 +1098,8 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             if shown():
                 parts.append(_mode_label(view))
             parts.append(core.context_text(turn.get("tokens"), result))
+            if settings.get("effort"):
+                parts.append("esfuerzo {}".format(settings.get("effort")))
             if settings.get("show_cost", False) and result.get("total_cost_usd") is not None:
                 parts.append("US$ {:.2f}".format(result["total_cost_usd"]))
             close_turn("— {}\n".format(" · ".join(part for part in parts if part)))
@@ -823,12 +1130,14 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
             return core.build_args(
                 claude, tools, permission_mode=mode, resume=resume,
                 model=settings.get("model"), effort=settings.get("effort"),
-                persist=not quiet, extra=extra, system=system, live=live)
+                persist=not quiet, extra=extra, system=system, live=live,
+                allowed=allowed, fallback=settings.get("fallback_model"))
 
         try:
             if use_live:
                 signature = [claude, cwd, tools, mode, settings.get("model"),
-                             settings.get("effort"), system, user_extra, review]
+                             settings.get("effort"), system, user_extra, review, allowed,
+                             settings.get("fallback_model")]
                 live = _sessions.get(view.id())
                 if live is not None and not (
                         resume and live["key"] == signature and live.get("sid") == resume
@@ -875,6 +1184,10 @@ def _ask(window, title, prompt, cwd, tools, mode=None, resume=None, echo=None,
         state.set(K_CWD, cwd)
         if not resume:
             state.erase(K_SESSION)
+        if note:
+            state.set(K_NOTE, note)
+        else:
+            state.erase(K_NOTE)
         if context is not None:
             state.set(K_CONTEXT, context.signature())
         turn["from"] = turn["view"].size()
@@ -924,11 +1237,19 @@ class ClaudeChatSendCommand(sublime_plugin.TextCommand):
         if not message:
             return
         state.erase(K_START)
+        view.erase_phantoms(BAR)
         view.set_read_only(True)
 
         context = _Context(window)
         session = state.get(K_SESSION)
         cwd = state.get(K_CWD) if session and state.get(K_CWD) else context.cwd
+        tools, mode, note, system = _chat_mode(view)
+        if SLASH.match(message):
+            # Un comando de Claude Code (/compact, una skill) viaja tal cual: con algo
+            # delante dejaría de ser un comando. El contexto y los avisos esperan.
+            _ask(window, "", message, cwd, tools, mode=mode, resume=session,
+                 chat=view, system=system, note=state.get(K_NOTE))
+            return
         prompt = message
         described = context.describe()
         if described and (not session or context.signature() != state.get(K_CONTEXT)):
@@ -943,9 +1264,32 @@ class ClaudeChatSendCommand(sublime_plugin.TextCommand):
             state.erase(K_NOTICE)
             if session:
                 prompt = "({})\n\n{}".format(notice, prompt)
-        tools, mode, note = _chat_mode(view)
+        if session and state.get(K_NOTE) != note:
+            # El prompt de sistema de una conversación ya empezada puede quedar como
+            # nació: el modo vigente viaja con el mensaje para que no siga al anterior.
+            prompt = "(Estado actual del chat, que reemplaza lo dicho antes sobre modo y " \
+                     "herramientas: {})\n\n{}".format(note, prompt)
         _ask(window, "", prompt, cwd, tools, mode=mode, resume=session,
-             context=context, chat=view, system=note)
+             context=context, chat=view, system=system, note=note)
+
+
+class ClaudeCompactCommand(sublime_plugin.WindowCommand):
+    """Resume la conversación para liberar contexto sin perder el hilo."""
+
+    def run(self):
+        chat = _find_chat(self.window)
+        if chat is None or not chat.settings().get(K_SESSION):
+            self.window.status_message("Claude: no hay una conversación que compactar.")
+            return
+        start = chat.settings().get(K_START)
+        if start is None:
+            self.window.status_message("Claude sigue trabajando; espera a que termine.")
+            return
+        if chat.substr(sublime.Region(start, chat.size())).strip():
+            self.window.status_message(
+                "Claude: envía o borra el mensaje a medio escribir antes de compactar.")
+            return
+        _send_text(chat, "/compact")
 
 
 class ClaudeQueueMessageCommand(sublime_plugin.WindowCommand):
@@ -1001,27 +1345,11 @@ class ClaudeNewChatCommand(sublime_plugin.WindowCommand):
         _drop_session(view.id())
         _queued.pop(view.id(), None)
         state = view.settings()
-        for key in (K_START, K_SESSION, K_CONTEXT, K_CWD, K_NOTICE, K_LIMIT):
+        for key in (K_START, K_SESSION, K_CONTEXT, K_CWD, K_NOTICE, K_LIMIT, K_NOTE):
             state.erase(key)
         view.set_read_only(False)
         view.run_command("claude_chat_replace", {"a": 0, "b": view.size(), "text": ""})
         _end_turn(view)
-
-
-class ClaudeToggleEditCommand(sublime_plugin.WindowCommand):
-    """Decide si lo que se pide desde el chat puede modificar archivos."""
-
-    def run(self):
-        view = _open_chat(self.window, focus=False)
-        enabled = not view.settings().get(K_EDIT)
-        _set_edit(view, enabled)
-        if view.settings().get(K_START) is not None:
-            # Con una consulta en curso no hay dónde anotarlo sin partir la respuesta.
-            _note(self.window, "— el chat ahora puede editar archivos\n" if enabled
-                  else "— el chat volvió a sólo lectura\n", view)
-        self.window.status_message(
-            "Claude: el chat puede editar archivos" if enabled
-            else "Claude: el chat es de sólo lectura")
 
 
 class ClaudeChatModeCommand(sublime_plugin.WindowCommand):
@@ -1047,6 +1375,10 @@ class ClaudeChatModeCommand(sublime_plugin.WindowCommand):
     def choose(self, view, index):
         if index < 0 or not view.is_valid():
             return
+        state = view.settings()
+        if index == (2 if state.get(K_EDIT) else 1 if state.get(K_PLAN) else 0):
+            # Elegir el modo en que ya está no cambia nada: no se anota otra vez.
+            return
         _set_edit(view, index == 2)
         _set_plan(view, index == 1)
         if view.settings().get(K_START) is not None:
@@ -1059,7 +1391,7 @@ class ClaudeToggleDiffsCommand(sublime_plugin.WindowCommand):
 
     def run(self):
         view = _find_chat(self.window)
-        regions = _diff_regions(view) + _code_regions(view) if view is not None else []
+        regions = _foldable(view) if view is not None else []
         if not regions:
             self.window.status_message("Claude: no hay bloques que plegar en el chat.")
             return
@@ -1069,6 +1401,7 @@ class ClaudeToggleDiffsCommand(sublime_plugin.WindowCommand):
                 view.unfold(region)
         else:
             view.fold(regions)
+        _fold_controls(view)
 
 
 class ClaudeReviewFileCommand(sublime_plugin.WindowCommand):
@@ -1087,7 +1420,7 @@ class ClaudeReviewFileCommand(sublime_plugin.WindowCommand):
             target = "el archivo {}".format(name) if context.rel else name
         _ask(self.window, "Revisión · {}".format(context.rel or "búfer sin guardar"),
              _with_context(REVIEW_FILE.format(target=target), context), context.cwd,
-             _settings().get("read_tools", core.READ_TOOLS), context=context)
+             _read_tools(), context=context)
 
 
 class ClaudeReviewChangesCommand(sublime_plugin.WindowCommand):
@@ -1106,7 +1439,7 @@ class ClaudeReviewChangesCommand(sublime_plugin.WindowCommand):
         prompt = "{}\n\n<git_status>\n{}</git_status>\n\n<git_diff{}>\n{}</git_diff>".format(
             REVIEW_CHANGES, status, ' recortado="si"' if truncated else "", diff)
         _ask(self.window, "Revisión · cambios sin confirmar", prompt, context.cwd,
-             _settings().get("read_tools", core.READ_TOOLS))
+             _read_tools())
 
 
 class ClaudeExplainBuildCommand(sublime_plugin.WindowCommand):
@@ -1121,7 +1454,7 @@ class ClaudeExplainBuildCommand(sublime_plugin.WindowCommand):
         context = _Context(self.window)
         prompt = "{}\n\n<salida>\n{}\n</salida>".format(EXPLAIN_BUILD, text[-BUFFER_LIMIT:])
         _ask(self.window, "Errores del build", prompt, context.cwd,
-             _settings().get("read_tools", core.READ_TOOLS))
+             _read_tools())
 
 
 def _saved_context(window, action):
@@ -1141,9 +1474,9 @@ def _ask_edit(window, title, prompt, context, echo=None):
     # se lanza igual que un mensaje suyo: el proceso sirve para lo que venga después.
     chat = _open_chat(window, focus=False)
     _set_edit(chat, True)
-    tools, mode, note = _chat_mode(chat)
+    tools, mode, note, system = _chat_mode(chat)
     _ask(window, title, prompt, context.cwd, tools, mode=mode, echo=echo, context=context,
-         system=note)
+         system=system, note=note)
 
 
 def _background(function):
@@ -1206,6 +1539,29 @@ def _lsp_lines(view, rel, severity):
         return lines if sessions else None
     except Exception:
         return None
+
+
+def _check_edits(window, chat, files, cwd):
+    """Los errores que LSP marca en lo recién editado viajan con el próximo mensaje."""
+    if not chat.is_valid():
+        return
+    lines = []
+    for path in files:
+        view = window.find_open_file(path)
+        if view is not None:
+            lines += _lsp_lines(view, os.path.relpath(path, cwd), 1) or []
+    if not lines:
+        return
+    lines = lines[:DIAGNOSTICS_LIMIT]
+    state = chat.settings()
+    previous = state.get(K_NOTICE)
+    state.set(K_NOTICE, "{}Aviso: tras tu última edición el editor marca estos errores en "
+                        "los archivos que tocaste:\n{}".format(
+                            previous + " " if previous else "", "\n".join(lines)))
+    if state.get(K_START) is not None:
+        _note(window, "— el editor marca {} error{} en lo editado; Claude los verá con tu "
+                      "próximo mensaje\n".format(len(lines), "" if len(lines) == 1 else "es"),
+              chat)
 
 
 class ClaudeFixDiagnosticsCommand(sublime_plugin.WindowCommand):
@@ -1285,22 +1641,6 @@ class ClaudeCommitMessageCommand(sublime_plugin.WindowCommand):
              core.NO_TOOLS, quiet=True, on_result=show)
 
 
-class ClaudeExplainClipboardCommand(sublime_plugin.WindowCommand):
-    """Explica el error o traceback que está copiado en el portapapeles."""
-
-    def run(self):
-        text = sublime.get_clipboard().strip()
-        if not text:
-            self.window.status_message("Claude: el portapapeles está vacío.")
-            return
-        context = _Context(self.window)
-        last = text.splitlines()[-1].strip()
-        prompt = "{}\n\n<error>\n{}\n</error>".format(EXPLAIN_ERROR, text[-BUFFER_LIMIT:])
-        _ask(self.window, "Error del portapapeles", prompt, context.cwd,
-             _settings().get("read_tools", core.READ_TOOLS),
-             echo=last if len(last) <= 200 else last[:197] + "...")
-
-
 class ClaudeRemoteLogsCommand(sublime_plugin.WindowCommand):
     """Trae los logs de un servicio del servidor y le pide a Claude un diagnóstico."""
 
@@ -1359,24 +1699,7 @@ class ClaudeRemoteLogsCommand(sublime_plugin.WindowCommand):
             REMOTE_DIAGNOSE.format(lines=lines, name=name, host=self.host),
             logs[-BUFFER_LIMIT:])
         _ask(self.window, "Logs · {}".format(name), prompt, context.cwd,
-             _settings().get("read_tools", core.READ_TOOLS))
-
-
-class ClaudeRemoteStatusCommand(ClaudeRemoteLogsCommand):
-    """Muestra qué servicios del servidor están caídos o reiniciándose. No usa a Claude."""
-
-    def choose(self, services):
-        problems, healthy = core.service_report(services)
-        lines = ["## Servidor · {}".format(self.host)]
-        lines += ["⚠ {} — {}".format(name, status or "sin estado") for name, status in problems]
-        if healthy:
-            lines.append("✓ {} en marcha: {}".format(
-                len(healthy), ", ".join(name for name, _ in healthy)))
-        if not services:
-            lines.append("No hay servicios.")
-        if problems:
-            lines.append("Para ver por qué: «Claude: Diagnosticar logs del servidor…».")
-        _note(self.window, "\n".join(lines) + "\n")
+             _read_tools())
 
 
 class ClaudeRunTestsCommand(sublime_plugin.WindowCommand):
@@ -1504,6 +1827,7 @@ class ClaudeHistoryCommand(sublime_plugin.WindowCommand):
         _set_plan(view, entry.get("plan") and not entry.get("edit"))
         _fold_diffs(view)
         _fold_code(view)
+        _fold_quotes(view)
         _end_turn(view)
 
 
@@ -1526,7 +1850,27 @@ class ClaudeSelectModelCommand(sublime_plugin.WindowCommand):
         settings = _settings()
         settings.set("model", model)
         sublime.save_settings(SETTINGS)
+        _refresh_bars(self.window)
         self.window.status_message("Claude: modelo {}".format(name))
+
+
+class ClaudeSelectEffortCommand(sublime_plugin.WindowCommand):
+    """Elige cuánto razona Claude en las próximas consultas."""
+
+    def run(self):
+        current = _settings().get("effort") or ""
+        items = [["{}{}".format("● " if effort == current else "", name), detail]
+                 for effort, name, detail in EFFORTS]
+        self.window.show_quick_panel(items, self.choose)
+
+    def choose(self, index):
+        if index < 0 or index >= len(EFFORTS):
+            return
+        effort, name, _ = EFFORTS[index]
+        _settings().set("effort", effort)
+        sublime.save_settings(SETTINGS)
+        _refresh_bars(self.window)
+        self.window.status_message("Claude: esfuerzo {}".format(name.lower()))
 
 
 class ClaudeRevertEditCommand(sublime_plugin.WindowCommand):
@@ -1569,15 +1913,17 @@ class ClaudeRevertEditCommand(sublime_plugin.WindowCommand):
         names = ", ".join(os.path.basename(path) for path in restored) or "nada que cambiar"
         left = core.edited_files(backup)
         if not left:
-            chat.settings().erase(K_BACKUP)
+            _set_backups(chat, [path for path in _backups(chat) if path != backup])
             shutil.rmtree(backup, ignore_errors=True)
+        older = len(_backups(chat)) if not left else 0
         # Claude no ve el disco entre mensajes: hay que contárselo en el siguiente.
         previous = chat.settings().get(K_NOTICE)
         chat.settings().set(K_NOTICE, "{}Aviso: el usuario revirtió {} ({}).".format(
             previous + " " if previous else "",
             "parte de tu última edición" if left else "tu última edición", names))
-        _note(self.window, "— edición revertida: {}{}\n".format(
-            names, " (quedan {} sin revertir)".format(len(left)) if left else ""), chat)
+        _note(self.window, "— edición revertida: {}{}{}\n".format(
+            names, " (quedan {} sin revertir)".format(len(left)) if left else "",
+            "; revertir otra vez deshace la edición anterior" if older else ""), chat)
 
     def is_enabled(self):
         chat = _find_chat(self.window)
@@ -1656,7 +2002,8 @@ def _has_terminus():
 class ClaudeTerminalCommand(sublime_plugin.WindowCommand):
     """Abre Claude Code interactivo en una terminal, en la carpeta del proyecto."""
 
-    def run(self, with_file=False):
+    def run(self, with_file=None):
+        """with_file: True exige un archivo guardado, False no lo pasa; si no, va si lo hay."""
         settings = _settings()
         claude = core.find_claude(settings.get("claude_path"))
         terminus = settings.get("terminal_mode", "auto") != "external" and _has_terminus()
@@ -1668,10 +2015,10 @@ class ClaudeTerminalCommand(sublime_plugin.WindowCommand):
             return
         context = _Context(self.window)
         prompt = None
-        if with_file:
-            if not context.rel:
-                sublime.error_message("Guarda el archivo antes de abrirlo con Claude.")
-                return
+        if with_file and not context.rel:
+            sublime.error_message("Guarda el archivo antes de abrirlo con Claude.")
+            return
+        if context.rel and with_file is not False:
             prompt = "Voy a trabajar en @{}. Léelo y espera mis instrucciones.".format(context.rel)
         if terminus:
             # Con Terminus la sesión interactiva queda en una pestaña del editor.
@@ -1718,6 +2065,8 @@ def _restore(view):
             view.run_command("claude_chat_replace", {"a": 0, "b": view.size(), "text": expected})
             view.sel().clear()
             view.sel().add(sublime.Region(view.size(), view.size()))
+            _show_bar(view)
+            _fold_controls(view)
     finally:
         # La guarda sigue puesta mientras se restaura: esas ediciones no se vigilan.
         _restoring.discard(view.id())
@@ -1801,6 +2150,10 @@ def plugin_loaded():
             if not intact:
                 view.settings().erase(K_START)
                 _end_turn(view)
+            else:
+                # Los controles no sobreviven al reinicio: se vuelven a poner.
+                _show_bar(view)
+                _fold_controls(view)
 
 
 def plugin_unloaded():

@@ -8,6 +8,9 @@ Llama a Claude Code (`claude`) desde el editor. Requiere Sublime Text 4 y el CLI
 escribe después de la marca `❯`:
 
 - `Enter` envía; `Shift+Enter` agrega una línea.
+- Sobre la marca hay una barra con tres desplegables —**modo**, **modelo** y **esfuerzo**—: un
+  clic abre la lista y otro elige. Hacen lo mismo que sus comandos; `"chat_controls": false`
+  la quita.
 - El archivo en que estabas trabajando (y su selección) viaja como contexto cuando cambia.
 - Todos los comandos responden en el chat, así que se les puede contestar ahí.
 - Doble clic sobre una cita `ruta:línea` abre el archivo.
@@ -17,15 +20,31 @@ escribe después de la marca `❯`:
   chat y la continúa. Se conservan las 50 más recientes, en `Packages/User/ClaudeCode/history`.
 - El chat tiene tres modos, que se eligen con `Ctrl+Alt+C`, `U`: **sólo lectura** (el de
   partida), **plan** (investiga y propone, sin tocar nada; la pestaña se llama «Claude ◇») y
-  **edición** («Claude ✎»). `Ctrl+Alt+C`, `M` alterna entre lectura y edición, y los comandos
-  que editan la activan solos.
+  **edición** («Claude ✎»). Los comandos que editan la activan solos. Tras un plan, la barra
+  ofrece **▶ Aplicar el plan**: pasa a edición y lo pide (lo que haya a medio escribir se suma
+  como ajuste).
+- La salida de cada comando queda escrita bajo la herramienta, plegada (`↳ salida · Bash pytest
+  -q`), y lo mismo el razonamiento cuando el modelo lo entrega (`✻ razonamiento`). Se abren con
+  su control. `"tool_output"` elige de qué herramientas y `"show_thinking"` lo apaga.
+- Un mensaje que empieza con `/` y un nombre viaja tal cual a Claude Code: sirve para sus
+  comandos y skills (`/compact`, `/code-review`…). «Compactar la conversación» (`Ctrl+Alt+C`,
+  `X`) resume lo conversado para liberar contexto sin empezar de cero.
+- `@ruta:10-40` adjunta sólo ese tramo del archivo. El contexto incluye también qué otros
+  archivos del proyecto están abiertos.
   `"chat_edit_default": true` hace que nazca pudiendo editar. Cada turno termina indicando el
   modo (`— listo (12 s) · sólo lectura`) y Claude sabe en cuál está, así que avisa cómo
   habilitar la edición en vez de limitarse a mostrar el código.
+- En cualquier modo Claude puede **buscar en la web y leer páginas** (`"web_tools"`), delegar
+  una búsqueda amplia en un subagente (`"agent_tools"`) y sigue un método de trabajo: investiga
+  antes de responder, reproduce y verifica cuando puede ejecutar, cita `ruta:línea` y da sus
+  fuentes (`"work_method"`; `"custom_instructions"` suma las tuyas). La web no pide permiso
+  (`"allowed_tools"`, donde también caben reglas como `"Bash(git log *)"`).
+- Si cambias de modo a mitad de una conversación, el modo nuevo viaja con el mensaje siguiente.
+- Sin selección, el contexto incluye la línea del cursor.
 - Mientras Claude piensa, prepara una herramienta o espera, el chat y la barra de estado lo
   dicen, con los segundos que lleva (`⋯ pensando… 12 s`); la línea desaparece cuando llega la
   respuesta. Si trabaja un subagente, muestra qué herramienta usa.
-- `Enter` mientras Claude responde (o `Ctrl+Alt+C`, `Q`) deja el mensaje en cola: se envía solo
+- `Enter` mientras Claude responde deja el mensaje en cola: se envía solo
   al terminar. Si la respuesta se detiene o falla, lo que estaba en cola vuelve al borrador.
 - «Abrir otro chat» (`Ctrl+Alt+C`, `Y`) abre una conversación más, que puede correr mientras la
   primera responde. Los comandos responden en el último chat que se usó.
@@ -33,7 +52,9 @@ escribe después de la marca `❯`:
   (`— listo (12 s) · sólo lectura · contexto 38 %`); cerca del 100 % conviene un chat nuevo.
   Los avisos de límite de uso del plan se anotan en el chat con la hora en que se restablece.
 - Un bloque de código largo de una respuesta llega plegado (`"fold_code_lines"`), igual que los
-  diffs.
+  diffs. Cada bloque plegable trae su control —`▸ mostrar 38 líneas` / `▾ plegar`— para abrirlo
+  o cerrarlo por separado con un clic (`"fold_controls"`); `Ctrl+Alt+C`, `K` sigue abriendo o
+  cerrando todos a la vez.
 - Con cambios sin guardar viaja el diff contra el archivo en disco, no el archivo entero; y con
   LSP, los errores y advertencias del archivo abierto (`"context_diagnostics"`).
 
@@ -46,12 +67,15 @@ al retomar otra conversación. Si ese proceso no llega a arrancar, el plugin lo 
 sigue con un proceso por mensaje hasta reiniciar Sublime.
 
 Ese proceso puede preguntar antes de actuar. En modo edición el chat suma las herramientas de
-`"ask_tools"` (de fábrica, `Bash`): cuando Claude quiere correr un comando —o leer o editar fuera
-de la carpeta de trabajo— aparece un panel con **Permitir**, **Permitir siempre** esa herramienta
-en la conversación o **Rechazar**; cerrarlo sin elegir es rechazar. El comando completo queda
+`"ask_tools"` y en sólo lectura y plan las de `"read_ask_tools"` (de fábrica, `Bash` en ambos:
+en lectura sirve para correr pruebas, mirar git o reproducir un error). Cuando Claude quiere
+correr un comando —o leer o editar fuera de la carpeta de trabajo— aparece un panel con
+**Permitir**, **Permitir siempre** o **Rechazar**; cerrarlo sin elegir es rechazar. «Permitir
+siempre» vale para ese programa (`pytest`, `git log`) o ese sitio web, no para la herramienta
+entera, y no se ofrece para comandos compuestos ni intérpretes (`python -c`, `bash`, `sudo`). El comando completo queda
 escrito en el chat (`? pide permiso: Bash pytest -q`). Lo que ya permitan tus ajustes de Claude
 Code no se pregunta. Lo que haga un comando no entra en el diff ni se puede revertir desde el
-plugin. `"ask_tools": ""` deja el chat sin ejecutar comandos, como antes.
+plugin. `"ask_tools": ""` y `"read_ask_tools": ""` dejan el chat sin ejecutar comandos.
 
 ## Comandos
 
@@ -63,27 +87,24 @@ Los atajos son `Ctrl+Alt+C` seguido de una letra.
 | Abrir chat | `a` | Abre el chat o lleva el cursor a él. |
 | Chat nuevo | `n` | Vacía el chat y olvida la conversación. |
 | Conversaciones anteriores… | `h` | Retoma un chat pasado. |
-| Adjuntar un archivo al mensaje… | `i` | Lo mismo que escribir `@` en el chat. |
+| Compactar la conversación | `x` | Resume lo conversado para liberar contexto; la conversación sigue. |
 | Abrir otro chat | `y` | Una conversación más, en su propia pestaña. |
-| Permitir o impedir que el chat edite | `m` | Alterna entre sólo lectura y edición de archivos. |
 | Elegir modo del chat… | `u` | Sólo lectura, plan o edición. |
-| Dejar un mensaje en cola… | `q` | Se envía cuando Claude termine de responder. |
 | Plegar o desplegar los bloques del chat | `k` | Abre los diffs y el código largo, o los vuelve a plegar. |
-| Elegir modelo… | `j` | Predeterminado, Opus, Sonnet o Haiku para las próximas consultas. |
+| Elegir modelo… | `j` | Predeterminado, Fable, Opus, Sonnet o Haiku para las próximas consultas. |
+| Elegir esfuerzo… | `f` | Cuánto razona antes de responder, de bajo a máximo; queda anotado en el cierre de cada turno. |
 | Revisar errores de este archivo | `r` | Revisa el archivo, o sólo la selección. |
 | Revisar cambios sin confirmar (git) | `d` | Revisa `git diff HEAD`. |
 | Explicar errores del último build | `b` | Lee la salida del último build de Sublime. |
-| Explicar el error del portapapeles | `x` | Para un traceback copiado de una terminal. |
-| Ver el estado del servidor | `v` | Lista por SSH qué servicios están caídos o reiniciándose. No usa a Claude. |
 | Diagnosticar logs del servidor… | `o` | Lista los servicios del servidor por SSH, trae los logs del elegido y los diagnostica. Sólo lee. |
 | Escribir código aquí… | `w` | Genera código y lo inserta en el cursor o reemplaza la selección (`Ctrl+Z` lo deshace). |
 | Editar este archivo… | `e` | Claude modifica el archivo en disco según una instrucción. |
 | Corregir avisos del linter | `l` | Corrige lo que marcan pyright y ruff (vía LSP; si no, ruff suelto). |
 | Generar pruebas (pytest) | `p` | Para la selección o el módulo, siguiendo la convención del proyecto. |
 | Correr las pruebas y corregir lo que falle | `c` | Corre pytest sobre las pruebas del archivo (`test_<nombre>.py`) con el Python del proyecto; si fallan, Claude corrige el código sin debilitar la prueba. |
-| Revertir la última edición | `z` | Devuelve los archivos a como estaban antes de la última edición de Claude; si tocó varios, deja elegir uno o todos. |
+| Revertir la última edición | `z` | Devuelve los archivos a como estaban antes de la última edición de Claude; si tocó varios, deja elegir uno o todos. Repetirlo deshace la edición anterior, hasta 10 turnos atrás. |
 | Proponer mensaje de commit | `g` | De lo preparado con `git add` (o de todo); queda en el chat y en el portapapeles. No hace el commit. |
-| Abrir en terminal | `t` / `f` | Claude Code interactivo, en una pestaña de Terminus si está instalado (`f`: con el archivo actual). |
+| Abrir en terminal | `t` | Claude Code interactivo, en una pestaña de Terminus si está instalado; si hay un archivo guardado abierto, arranca con él. |
 | Detener | `s` | Corta la consulta del chat en uso. |
 
 ## Ediciones
@@ -95,6 +116,10 @@ después. Se apaga con `"review_edits": false`.
 
 Si la edición tocó varios archivos, «Revertir la última edición» pregunta cuál: uno solo o
 todos. Lo que quede sin revertir sigue disponible, y Claude se entera en el mensaje siguiente.
+
+Cada turno que edita deja su propio respaldo (se guardan los 10 últimos): al revertir uno, el
+comando queda apuntando al anterior. Tras una edición, los errores que LSP marque en los
+archivos tocados se anotan en el chat y viajan con el mensaje siguiente (`"check_after_edit"`).
 
 El diff llega plegado, un pliegue por archivo: se ve el encabezado de cada uno y el total de
 líneas agregadas y quitadas. `Ctrl+Alt+C`, `K` (o la marca del pliegue) lo abre.
