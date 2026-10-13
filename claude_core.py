@@ -1461,6 +1461,18 @@ def history_save(folder, entry, keep=50):
             pass
 
 
+def history_delete(entries):
+    """Borra del historial las conversaciones dadas; devuelve cuántas quitó."""
+    removed = 0
+    for entry in entries:
+        try:
+            os.remove(entry["file"])
+            removed += 1
+        except (OSError, KeyError):
+            pass
+    return removed
+
+
 def history_list(folder):
     """Conversaciones guardadas, de la más reciente a la más antigua."""
     entries = []

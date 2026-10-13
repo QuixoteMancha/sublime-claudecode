@@ -1976,21 +1976,60 @@ class ClaudeAttachFileCommand(sublime_plugin.WindowCommand):
 
 
 class ClaudeHistoryCommand(sublime_plugin.WindowCommand):
-    """Retoma una conversación anterior: vuelve su texto al chat y sigue esa sesión."""
+    """Retoma una conversación anterior, o elimina del historial las que sobren."""
 
-    def run(self):
+    def listing(self):
+        """Las conversaciones guardadas y sus renglones para un panel, o None si no hay."""
         entries = core.history_list(_history_dir())
         if not entries:
-            self.window.status_message("Claude: todavía no hay conversaciones guardadas.")
-            return
+            return None
         now = time.time()
         items = [[entry.get("title") or "Conversación", "{} · {}".format(
             core.age_text(now - entry["updated"]),
             os.path.basename(entry.get("cwd") or "") or "sin carpeta")] for entry in entries]
+        return entries, items
+
+    def run(self):
+        listed = self.listing()
+        if listed is None:
+            self.window.status_message("Claude: todavía no hay conversaciones guardadas.")
+            return
+        entries, items = listed
+        items.append(["Eliminar conversaciones…", "Borra del historial las que elijas, o todas"])
         self.window.show_quick_panel(items, lambda index: self.load(entries, index))
+
+    def forget(self):
+        """Panel para borrar: cada elección quita una conversación y vuelve a ofrecer el resto."""
+        listed = self.listing()
+        if listed is None:
+            self.window.status_message("Claude: el historial quedó vacío.")
+            return
+        entries, items = listed
+        items = [["✗ {}".format(title), detail] for title, detail in items]
+        items.append(["Eliminar todas ({})".format(len(entries)), "Pide confirmación"])
+
+        def chosen(index):
+            if index < 0:
+                return
+            if index < len(entries):
+                core.history_delete([entries[index]])
+                self.window.status_message("Claude: conversación eliminada del historial.")
+                # Con retardo: Sublime no abre un panel desde el cierre de otro.
+                sublime.set_timeout(self.forget, 10)
+            elif sublime.ok_cancel_dialog(
+                    "Se eliminarán del historial las {} conversaciones guardadas.\n\n"
+                    "No se puede deshacer.".format(len(entries)), "Eliminar todas"):
+                removed = core.history_delete(entries)
+                self.window.status_message(
+                    "Claude: {} conversaciones eliminadas del historial.".format(removed))
+
+        self.window.show_quick_panel(items, chosen)
 
     def load(self, entries, index):
         if index < 0:
+            return
+        if index >= len(entries):
+            sublime.set_timeout(self.forget, 10)
             return
         view = _open_chat(self.window)
         if _busy(view):

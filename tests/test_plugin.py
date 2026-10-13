@@ -1307,7 +1307,8 @@ class ChatTest(unittest.TestCase):
 
         plugin.ClaudeHistoryCommand(self.window).run()
         items, on_select = self.window.quick[-1]
-        self.assertEqual([item[0] for item in items], ["otra cosa distinta", "Revisión · src/a.py"])
+        self.assertEqual([item[0] for item in items], [
+            "otra cosa distinta", "Revisión · src/a.py", "Eliminar conversaciones…"])
         self.assertEqual(items[1][1], "recién · app")
         on_select(1)
         chat = self.chat
@@ -1320,6 +1321,47 @@ class ChatTest(unittest.TestCase):
         self.last.play()
         # Sigue siendo una sola entrada por sesión.
         self.assertEqual(len(plugin.core.history_list(plugin._history_dir())), 2)
+
+    def stored(self):
+        return [entry["session"] for entry in plugin.core.history_list(plugin._history_dir())]
+
+    def test_eliminar_conversaciones_del_historial(self):
+        plugin.ClaudeChatCommand(self.window).run()
+        for number, text in enumerate(("primera", "segunda", "tercera"), 1):
+            plugin.ClaudeNewChatCommand(self.window).run()
+            self.say(text)
+            self.last.play([("session", "h{}".format(number)), ("text_start", None),
+                            ("text", "Vale."), ("result", {"result": "x", "is_error": False})])
+        self.assertEqual(sorted(self.stored()), ["h1", "h2", "h3"])
+        plugin.ClaudeHistoryCommand(self.window).run()
+        items, choose = self.window.quick[-1]
+        del timers[:]
+        choose(len(items) - 1)
+        timers.pop()()
+        items, forget = self.window.quick[-1]
+        self.assertEqual([item[0] for item in items], [
+            "✗ tercera", "✗ segunda", "✗ primera", "Eliminar todas (3)"])
+        # Cada elección borra una y vuelve a ofrecer las que quedan; Esc no borra nada.
+        forget(1)
+        self.assertEqual(sorted(self.stored()), ["h1", "h3"])
+        timers.pop()()
+        items, forget = self.window.quick[-1]
+        self.assertEqual([item[0] for item in items], [
+            "✗ tercera", "✗ primera", "Eliminar todas (2)"])
+        forget(-1)
+        self.assertEqual((sorted(self.stored()), timers), (["h1", "h3"], []))
+        # «Todas» pide confirmación.
+        dialogs["answer"] = False
+        self.addCleanup(dialogs.__setitem__, "answer", True)
+        forget(2)
+        self.assertEqual(len(self.stored()), 2)
+        self.assertIn("2 conversaciones guardadas", dialogs["shown"][-1])
+        dialogs["answer"] = True
+        forget(2)
+        self.assertEqual(self.stored(), [])
+        del dialogs["shown"][:]
+        plugin.ClaudeHistoryCommand(self.window).run()
+        self.assertIn("todavía no hay conversaciones", self.window.messages[-1])
 
     def test_controles_desplegables_del_chat(self):
         self.addCleanup(SETTINGS.__setitem__, "effort", "")

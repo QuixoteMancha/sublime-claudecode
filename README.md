@@ -117,7 +117,7 @@ Los atajos son `Ctrl+Alt+C` seguido de una letra.
 |---|---|---|
 | Abrir chat | `a` | Abre el chat o lleva el cursor a él. |
 | Chat nuevo | `n` | Vacía el chat y olvida la conversación. |
-| Conversaciones anteriores… | `h` | Retoma un chat pasado. |
+| Conversaciones anteriores… | `h` | Retoma un chat pasado. La última opción de la lista, «Eliminar conversaciones…», borra del historial las que elijas o todas. |
 | Compactar la conversación | `x` | Resume lo conversado para liberar contexto; la conversación sigue. |
 | Abrir otro chat | `y` | Una conversación más, en su propia pestaña. |
 | Elegir modo del chat… | `u` | Sólo lectura, plan o edición. |
