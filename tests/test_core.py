@@ -152,6 +152,7 @@ class Helpers(unittest.TestCase):
         self.assertNotIn("WebSearch", read)
         full = core.method_note("Read,Bash,WebSearch,WebFetch,Agent")
         for expected in ("reproduce el fallo", "da la URL", "subagente", "`ruta:línea`",
+                         "fuera del proyecto",
                          "al menos dos alternativas", "línea base"):
             self.assertIn(expected, full)
         self.assertNotIn("línea base", read)

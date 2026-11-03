@@ -148,7 +148,10 @@ METHOD = (
 )
 METHOD_RUN = (
     "Puedes ejecutar comandos: reproduce el fallo antes de corregirlo y, después de "
-    "editar, corre las pruebas o el linter que correspondan y cuenta el resultado."
+    "editar, corre las pruebas o el linter que correspondan y cuenta el resultado. Si "
+    "necesitas un guion o un archivo de prueba pasajero, créalo fuera del proyecto (en "
+    "$TMPDIR o /tmp) y bórralo al terminar: la carpeta del proyecto está a la vista en el "
+    "editor y no debe llenarse de archivos sueltos."
 )
 METHOD_NO_RUN = (
     "No puedes ejecutar nada: cuando propongas o apliques un cambio, di con qué comando "
